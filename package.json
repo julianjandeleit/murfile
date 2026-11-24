@@ -22,7 +22,8 @@
     "dev": "vite --config vite.config.js",
     "build": "vite build --config vite.config.js",
     "preview": "vite preview --config vite.config.js",
-    "cli": "node ./bin/murfile.js"
+    "cli": "node ./bin/murfile.js",
+    "build:qr-fixed": "node ./scripts/build-fixed-qr.js"
   },
   "dependencies": {
     "@blockchaincommons/dcbor": "1.0.0-beta.3",

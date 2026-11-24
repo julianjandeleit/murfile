@@ -2,8 +2,9 @@
 import { createHash } from 'node:crypto';
 import { mkdir, readFile, readdir, rename, writeFile } from 'node:fs/promises';
 import { basename, join, resolve } from 'node:path';
-import { renderUrQr } from '@blockchaincommons/multipart-ur';
-import { FileDecoder, FileEncoder } from '../src/index.js';
+import { RenderedImage, qrModuleCount, renderUrQr } from '@blockchaincommons/multipart-ur';
+import { encodeQr as encodeFixedQr } from '../src/vendor/qr-fixed.js';
+import { createBytesUr, FileDecoder, FileEncoder } from '../src/index.js';
 
 const VERSION = '0.1.0';
 
@@ -24,8 +25,9 @@ Commands:
 
 Encode options:
   --out <dir>                     Output directory (required)
-  --frames <count>                Number of MUR fragments to emit (required for multipart files)
-  --max-fragment-length <bytes>   Maximum MUR fragment payload (default: 100)
+  --frames <count>                Number of MUR fragments (default: source count + 10% redundancy)
+  --max-fragment-length <bytes>   Maximum MUR fragment payload (default: largest QR-fitting size)
+  --qr-version <version>           Force QR matrix version 1-40 (default: automatic)
   --size <pixels>                 QR image width/height (default: 512)
   --correction <level>            low|medium|quartile|high (default: medium)
   --format <format>               both|png|ur (default: both)
@@ -59,7 +61,7 @@ function parseArgs(argv) {
   const positionals = [];
   const options = {};
   const valueOptions = new Set([
-    '--out', '-o', '--frames', '--max-fragment-length', '--size', '--correction', '--format',
+    '--out', '-o', '--frames', '--max-fragment-length', '--qr-version', '--size', '--correction', '--format',
   ]);
   const aliases = { '-o': '--out' };
 
@@ -99,12 +101,142 @@ function sha256(bytes) {
   return createHash('sha256').update(bytes).digest('hex');
 }
 
+const AUTO_FRAME_REDUNDANCY = 0.10;
+const QR_EC_LEVELS = { low: 'L', medium: 'M', quartile: 'Q', high: 'H' };
+
+function qrModulesForFragment(fragment, correction, requestedVersion) {
+  const bytes = new TextEncoder().encode(fragment.toUpperCase());
+  if (requestedVersion !== undefined) {
+    return encodeFixedQr(bytes, QR_EC_LEVELS[correction], requestedVersion).width;
+  }
+  return qrModuleCount(bytes, correction);
+}
+
+function renderFixedUrQr(fragment, { size, correction, version }) {
+  const bytes = new TextEncoder().encode(fragment.toUpperCase());
+  const symbol = encodeFixedQr(bytes, QR_EC_LEVELS[correction], version);
+  const quietZone = 1;
+  const totalModules = symbol.width + quietZone * 2;
+  const pixelsPerModule = Math.max(1, Math.floor(size / totalModules));
+  const rasterSize = totalModules * pixelsPerModule;
+  const raster = new Uint8Array(rasterSize * rasterSize * 4);
+  raster.fill(255);
+
+  for (let row = 0; row < symbol.width; row += 1) {
+    for (let column = 0; column < symbol.width; column += 1) {
+      if (symbol.modules[row * symbol.width + column] === 0) continue;
+      const x0 = (column + quietZone) * pixelsPerModule;
+      const y0 = (row + quietZone) * pixelsPerModule;
+      for (let y = y0; y < y0 + pixelsPerModule; y += 1) {
+        for (let x = x0; x < x0 + pixelsPerModule; x += 1) {
+          const offset = (y * rasterSize + x) * 4;
+          raster[offset] = 0;
+          raster[offset + 1] = 0;
+          raster[offset + 2] = 0;
+        }
+      }
+    }
+  }
+
+  const pixels = new Uint8Array(size * size * 4);
+  for (let y = 0; y < size; y += 1) {
+    const sourceY = Math.min(Math.floor((y * rasterSize) / size), rasterSize - 1);
+    for (let x = 0; x < size; x += 1) {
+      const sourceX = Math.min(Math.floor((x * rasterSize) / size), rasterSize - 1);
+      const sourceOffset = (sourceY * rasterSize + sourceX) * 4;
+      const targetOffset = (y * size + x) * 4;
+      pixels.set(raster.subarray(sourceOffset, sourceOffset + 4), targetOffset);
+    }
+  }
+
+  return new RenderedImage({ width: size, height: size, pixels });
+}
+
+function candidateFragmentsFitQrVersion(data, fragmentLength, correction, requestedVersion, requestedFrameCount) {
+  const encoder = new FileEncoder(data, { maxFragmentLength: fragmentLength });
+  if (encoder.isSinglePart) {
+    try {
+      qrModulesForFragment(encoder.nextFragment(), correction, requestedVersion);
+      return true;
+    } catch {
+      return false;
+    }
+  }
+
+  const frameCount = requestedFrameCount
+    ?? Math.ceil(encoder.sourcePartCount * (1 + AUTO_FRAME_REDUNDANCY));
+  const testCount = Math.max(frameCount, encoder.sourcePartCount);
+  let firstFragment;
+  let lastFragment;
+
+  // Use actual MUR output. The first and last frames cover the sequence
+  // header's shortest and longest values; fragment payload lengths are fixed.
+  for (let index = 0; index < testCount; index += 1) {
+    const fragment = encoder.nextFragment();
+    if (fragment === undefined) return false;
+    if (index === 0) firstFragment = fragment;
+    if (index === testCount - 1) lastFragment = fragment;
+  }
+
+  try {
+    qrModulesForFragment(firstFragment, correction, requestedVersion);
+    if (lastFragment !== firstFragment) {
+      qrModulesForFragment(lastFragment, correction, requestedVersion);
+    }
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+/** Find the largest fragment payload fitting the automatic or requested QR version. */
+function chooseMaxFragmentLength(data, correction, requestedVersion, requestedFrameCount) {
+  const bytes = new Uint8Array(data);
+  const payloadLength = createBytesUr(bytes).cbor.toData().byteLength;
+  let lowerBound = 1;
+  let upperBound = payloadLength;
+  let best = 0;
+
+  while (lowerBound <= upperBound) {
+    const candidate = Math.floor((lowerBound + upperBound) / 2);
+    if (candidateFragmentsFitQrVersion(
+      bytes,
+      candidate,
+      correction,
+      requestedVersion,
+      requestedFrameCount,
+    )) {
+      best = candidate;
+      lowerBound = candidate + 1;
+    } else {
+      upperBound = candidate - 1;
+    }
+  }
+
+  if (best === 0) {
+    const target = requestedVersion === undefined
+      ? 'the maximum supported QR version'
+      : `QR version ${requestedVersion}`;
+    throw new Error(`No UR fragment fits ${target} with correction level ${correction}.`);
+  }
+
+  return best;
+}
+
 async function encodeCommand(inputPath, options) {
   if (!options.out) throw new Error('encode requires --out <directory>.');
   const requestedFrameCount = options.frames
     ? positiveInteger(options.frames, '--frames')
     : undefined;
-  const maxFragmentLength = positiveInteger(options.max_fragment_length ?? '100', '--max-fragment-length');
+  const requestedMaxFragmentLength = options.max_fragment_length === undefined
+    ? undefined
+    : positiveInteger(options.max_fragment_length, '--max-fragment-length');
+  const requestedQrVersion = options.qr_version === undefined
+    ? undefined
+    : positiveInteger(options.qr_version, '--qr-version');
+  if (requestedQrVersion !== undefined && requestedQrVersion > 40) {
+    throw new Error('--qr-version must be between 1 and 40.');
+  }
   const size = positiveInteger(options.size ?? '512', '--size');
   const correction = options.correction ?? 'medium';
   const format = options.format ?? 'both';
@@ -116,17 +248,22 @@ async function encodeCommand(inputPath, options) {
   }
 
   const input = await readFile(inputPath);
+  const inputBytes = new Uint8Array(input);
+  const maxFragmentLength = requestedMaxFragmentLength
+    ?? chooseMaxFragmentLength(inputBytes, correction, requestedQrVersion, requestedFrameCount);
+  const encoder = new FileEncoder(inputBytes, { maxFragmentLength });
+  const automaticFrameCount = encoder.isSinglePart
+    ? 1
+    : Math.ceil(encoder.sourcePartCount * (1 + AUTO_FRAME_REDUNDANCY));
+  const frameCount = encoder.isSinglePart
+    ? 1
+    : requestedFrameCount ?? automaticFrameCount;
+
   const outputDirectory = resolve(options.out);
   await mkdir(outputDirectory, { recursive: true });
   const existing = await readdir(outputDirectory);
   if (existing.length > 0 && !options.force) {
     throw new Error(`Output directory is not empty: ${outputDirectory} (use --force to overwrite files).`);
-  }
-
-  const encoder = new FileEncoder(new Uint8Array(input), { maxFragmentLength });
-  const frameCount = encoder.isSinglePart ? 1 : requestedFrameCount;
-  if (!frameCount) {
-    throw new Error(`This file needs multipart UR (${encoder.sourcePartCount} source fragments). Specify --frames <count> (at least ${encoder.sourcePartCount}).`);
   }
   if (!encoder.isSinglePart && frameCount < encoder.sourcePartCount) {
     throw new Error(`--frames must be at least ${encoder.sourcePartCount} for this file; increase it for loss tolerance.`);
@@ -137,6 +274,18 @@ async function encodeCommand(inputPath, options) {
     throw new Error('The encoder ended before the requested frame count.');
   }
 
+  const firstQrModules = qrModulesForFragment(fragments[0], correction, requestedQrVersion);
+  if (requestedQrVersion !== undefined) {
+    const expectedModules = 17 + 4 * requestedQrVersion;
+    for (let index = 0; index < fragments.length; index += 1) {
+      const modules = qrModulesForFragment(fragments[index], correction, requestedQrVersion);
+      if (modules !== expectedModules) {
+        throw new Error(`Frame ${index + 1} did not use the requested QR version ${requestedQrVersion}.`);
+      }
+    }
+  }
+
+  const actualQrVersion = (firstQrModules - 17) / 4;
   const width = String(frameCount).length;
   for (let index = 0; index < fragments.length; index += 1) {
     const stem = `frame-${String(index + 1).padStart(width, '0')}`;
@@ -146,7 +295,9 @@ async function encodeCommand(inputPath, options) {
       await writeFile(join(outputDirectory, `${stem}.ur.txt`), `${fragment}\n`, 'utf8');
     }
     if (format === 'both' || format === 'png') {
-      const image = renderUrQr(fragment, { size, correction });
+      const image = requestedQrVersion === undefined
+        ? renderUrQr(fragment, { size, correction })
+        : renderFixedUrQr(fragment, { size, correction, version: requestedQrVersion });
       await writeFile(join(outputDirectory, `${stem}.png`), image.toPng());
     }
   }
@@ -160,7 +311,12 @@ async function encodeCommand(inputPath, options) {
     frameCount,
     sourcePartCount: encoder.sourcePartCount,
     maxFragmentLength,
-    qr: format === 'ur' ? null : { size, correction },
+    qr: {
+      size: format === 'ur' ? null : size,
+      correction,
+      version: actualQrVersion,
+      modules: firstQrModules,
+    },
     generatedBy: `murfile/${VERSION}`,
     protocol: 'Blockchain Commons BCR-2020-005 + BCR-2024-001',
   };
@@ -172,6 +328,7 @@ async function encodeCommand(inputPath, options) {
   console.log(`Frames:  ${frameCount}`);
   console.log(`Output:  ${outputDirectory}`);
   console.log(`Format:  ${format}`);
+  console.log(`QR:      version ${actualQrVersion} (${firstQrModules} modules)`);
   if (!encoder.isSinglePart) console.log(`Source fragments: ${encoder.sourcePartCount}; exported fragments include fountain redundancy.`);
 }
 

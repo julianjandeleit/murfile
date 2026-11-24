@@ -1,0 +1,36 @@
+{
+  "name": "murfile",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "File-oriented encoder, decoder, CLI and local live reader for Blockchain Commons Multipart UR.",
+  "license": "MIT",
+  "engines": {
+    "node": ">=22.12.0"
+  },
+  "bin": {
+    "murfile": "./bin/murfile.js"
+  },
+  "exports": {
+    ".": "./src/index.js",
+    "./encoder": "./src/encoder.js",
+    "./decoder": "./src/decoder.js"
+  },
+  "scripts": {
+    "test": "node --test",
+    "test:watch": "node --test --watch",
+    "dev": "vite --config vite.config.js",
+    "build": "vite build --config vite.config.js",
+    "preview": "vite preview --config vite.config.js",
+    "cli": "node ./bin/murfile.js"
+  },
+  "dependencies": {
+    "@blockchaincommons/dcbor": "1.0.0-beta.3",
+    "@blockchaincommons/multipart-ur": "1.0.0-beta.5",
+    "@blockchaincommons/uniform-resources": "1.0.0-beta.5",
+    "@undecaf/zbar-wasm": "0.11.0"
+  },
+  "devDependencies": {
+    "vite": "^7.0.0"
+  }
+}

@@ -19,7 +19,7 @@ test('2.1 MB application-size roundtrip through the official MUR implementation'
 
   assert.equal(decoder.complete, true, `decoder progress was ${(decoder.progress * 100).toFixed(2)} %`);
   assert.equal(hash(decoder.result), hash(original));
-  assert.deepEqual(decoder.result, original);
+  assert.deepEqual(Buffer.from(decoder.result), Buffer.from(original));
 });
 
 test('extra fountain fragments are tolerated after completion', () => {

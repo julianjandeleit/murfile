@@ -219,7 +219,6 @@ async function collectDecoder(inputPath) {
     const fragments = extractUrStrings(source.text);
     totalCandidates += fragments.length;
     decoder.addMany(fragments);
-    if (decoder.complete) break;
   }
   return { decoder, totalCandidates, sources };
 }

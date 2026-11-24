@@ -5,8 +5,7 @@ import { UR } from '@blockchaincommons/uniform-resources';
 import { FileDecoder, FileEncoder, createBytesUr, isMultipartUrCandidate } from '../src/index.js';
 
 function equalBytes(actual, expected) {
-  assert.equal(actual.byteLength, expected.byteLength);
-  assert.deepEqual(actual, expected);
+  assert.deepEqual(Buffer.from(actual), Buffer.from(expected));
 }
 
 test('FileEncoder emits a single-part UR when the CBOR payload fits one fragment', () => {

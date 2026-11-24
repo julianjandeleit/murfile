@@ -6,6 +6,7 @@ const projectRoot = dirname(fileURLToPath(import.meta.url));
 
 export default defineConfig({
   root: resolve(projectRoot, 'web'),
+  base: '/murfile/',
   resolve: {
     // ZBar's inlined build avoids fetching a separate .wasm file at runtime.
     conditions: ['zbar-inlined', 'module', 'browser'],

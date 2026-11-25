@@ -190,3 +190,11 @@ footer { display: flex; justify-content: space-between; gap: 15px; padding-top: 
   font-variant-numeric: tabular-nums;
   text-align: right;
 }
+
+.page-progress-label {
+  margin: -0.35rem 0 0.85rem;
+  color: #aab5c2;
+  font-size: 10px;
+  font-variant-numeric: tabular-nums;
+}
+

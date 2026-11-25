@@ -1,8 +1,9 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { randomBytes } from 'node:crypto';
+import { randomBytes, createHash } from 'node:crypto';
 import { UR } from '@blockchaincommons/uniform-resources';
 import { FileDecoder, FileEncoder, createBytesUr, isMultipartUrCandidate } from '../src/index.js';
+import { createPageEnvelope } from '../src/page-transfer.js';
 
 function equalBytes(actual, expected) {
   assert.deepEqual(Buffer.from(actual), Buffer.from(expected));
@@ -116,6 +117,43 @@ test('FileDecoder reports malformed UR strings without throwing', () => {
   const result = decoder.add('ur:bytes/not-a-valid-bytewords-payload');
   assert.equal(result.kind, 'invalid');
   assert.equal(decoder.status.invalidUris, 1);
+});
+
+test('FileDecoder reconstructs independent page-scoped MUR sessions in interleaved order', () => {
+  const original = randomBytes(1800);
+  const fileHash = createHash('sha256').update(original).digest('hex');
+  const chunkCapacity = 900;
+  const pageFragments = [];
+
+  for (let pageIndex = 0; pageIndex < 2; pageIndex += 1) {
+    const chunk = original.slice(pageIndex * chunkCapacity, (pageIndex + 1) * chunkCapacity);
+    const envelope = createPageEnvelope({
+      pageIndex,
+      pageCount: 2,
+      originalSize: original.byteLength,
+      chunkLength: chunk.byteLength,
+      chunk,
+      fileSha256: fileHash,
+    });
+    const encoder = new FileEncoder(envelope, { maxFragmentLength: 128 });
+    pageFragments.push(encoder.take(encoder.sourcePartCount + 3));
+  }
+
+  const decoder = new FileDecoder();
+  const longest = Math.max(...pageFragments.map((fragments) => fragments.length));
+  for (let frameIndex = 0; frameIndex < longest && !decoder.complete; frameIndex += 1) {
+    for (const fragments of pageFragments) {
+      if (fragments[frameIndex]) decoder.add(fragments[frameIndex]);
+      if (decoder.complete) break;
+    }
+  }
+
+  assert.equal(decoder.complete, true);
+  equalBytes(decoder.result, original);
+  assert.equal(decoder.status.mode, 'pages');
+  assert.equal(decoder.status.completedPages, 2);
+  assert.equal(decoder.status.pageCount, 2);
+  assert.equal(decoder.status.expectedSha256, fileHash);
 });
 
 test('multipart candidate detection distinguishes single-part URs', () => {

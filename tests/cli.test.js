@@ -1,7 +1,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { spawnSync } from 'node:child_process';
-import { mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
+import { mkdtemp, readFile, readdir, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { randomBytes, createHash } from 'node:crypto';
@@ -117,6 +117,73 @@ test('CLI forces every emitted QR to the requested matrix version', async () => 
     const firstStem = `frame-${String(1).padStart(frameDigits, '0')}`;
     const png = await readFile(join(framesDirectory, `${firstStem}.png`));
     assert.deepEqual(Array.from(png.subarray(0, 8)), [137, 80, 78, 71, 13, 10, 26, 10]);
+  } finally {
+    await rm(directory, { recursive: true, force: true });
+  }
+});
+
+test('CLI exports QR frames as row-major grid PNG pages', async () => {
+  const directory = await mkdtemp(join(tmpdir(), 'murfile-grid-'));
+  try {
+    const sourcePath = join(directory, 'sample.bin');
+    const framesDirectory = join(directory, 'frames');
+    const outputPath = join(directory, 'recovered.bin');
+    const original = randomBytes(4000);
+    const targetVersion = 15;
+    const size = 128;
+    const columns = 2;
+    const rows = 2;
+    const gap = 7;
+    const padding = 13;
+    await writeFile(sourcePath, original);
+
+    const encoded = runCli([
+      'encode', sourcePath,
+      '--out', framesDirectory,
+      '--qr-version', String(targetVersion),
+      '--max-fragment-length', '100',
+      '--size', String(size),
+      '--grid', `${columns}x${rows}`,
+      '--grid-gap', String(gap),
+      '--grid-padding', String(padding),
+      '--format', 'both',
+    ]);
+    assert.equal(encoded.status, 0, encoded.stderr || encoded.stdout);
+
+    const manifest = JSON.parse(await readFile(join(framesDirectory, 'manifest.json'), 'utf8'));
+    assert.equal(manifest.fountainScope, 'page');
+    assert.equal(manifest.grid.fountainScope, 'page');
+    assert.equal(manifest.grid.columns, columns);
+    assert.equal(manifest.grid.rows, rows);
+    assert.equal(manifest.grid.gap, gap);
+    assert.equal(manifest.grid.padding, padding);
+    assert.equal(manifest.grid.framesPerPage, columns * rows);
+    assert.equal(manifest.grid.pageCount, Math.ceil(manifest.frameCount / (columns * rows)));
+    assert.equal(manifest.grid.dataFramesPerPage, 3);
+    assert.equal(manifest.grid.repairFramesPerPage, 1);
+    assert.equal(manifest.grid.ordering, 'row-major');
+    assert.equal(manifest.qr.version, targetVersion);
+
+    const files = await readdir(framesDirectory);
+    const pageFiles = files.filter((file) => /^page-\d+\.png$/.test(file)).sort();
+    const urFiles = files.filter((file) => /^page-\d+-frame-\d+\.ur\.txt$/.test(file));
+    const individualPngFiles = files.filter((file) => /^frame-\d+\.png$/.test(file));
+    assert.equal(pageFiles.length, manifest.grid.pageCount);
+    assert.equal(urFiles.length, manifest.frameCount);
+    assert.equal(individualPngFiles.length, 0);
+
+    const expectedWidth = columns * size + (columns - 1) * gap + 2 * padding;
+    const expectedHeight = rows * size + (rows - 1) * gap + 2 * padding;
+    for (const pageFile of pageFiles) {
+      const png = await readFile(join(framesDirectory, pageFile));
+      assert.deepEqual(Array.from(png.subarray(0, 8)), [137, 80, 78, 71, 13, 10, 26, 10]);
+      assert.equal(png.readUInt32BE(16), expectedWidth);
+      assert.equal(png.readUInt32BE(20), expectedHeight);
+    }
+
+    const decoded = runCli(['decode', framesDirectory, '--out', outputPath]);
+    assert.equal(decoded.status, 0, decoded.stderr || decoded.stdout);
+    assert.equal(hash(await readFile(outputPath)), hash(original));
   } finally {
     await rm(directory, { recursive: true, force: true });
   }

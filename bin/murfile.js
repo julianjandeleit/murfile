@@ -5,6 +5,7 @@ import { basename, join, resolve } from 'node:path';
 import { RenderedImage, qrModuleCount, renderUrQr } from '@blockchaincommons/multipart-ur';
 import { encodeQr as encodeFixedQr } from '../src/vendor/qr-fixed.js';
 import { createBytesUr, FileDecoder, FileEncoder } from '../src/index.js';
+import { createPageEnvelope, PAGE_ENVELOPE_HEADER_LENGTH } from '../src/page-transfer.js';
 
 const VERSION = '0.1.0';
 
@@ -28,6 +29,9 @@ Encode options:
   --frames <count>                Number of MUR fragments (default: source count + 10% redundancy)
   --max-fragment-length <bytes>   Maximum MUR fragment payload (default: largest QR-fitting size)
   --qr-version <version>           Force QR matrix version 1-40 (default: automatic)
+  --grid <columns>x<rows>          Arrange QR codes on PNG pages, e.g. 3x3
+  --grid-gap <pixels>              Gap between QR codes (default: 24; requires --grid)
+  --grid-padding <pixels>          Outer grid margin (default: 48; requires --grid)
   --size <pixels>                 QR image width/height (default: 512)
   --correction <level>            low|medium|quartile|high (default: medium)
   --format <format>               both|png|ur (default: both)
@@ -61,7 +65,7 @@ function parseArgs(argv) {
   const positionals = [];
   const options = {};
   const valueOptions = new Set([
-    '--out', '-o', '--frames', '--max-fragment-length', '--qr-version', '--size', '--correction', '--format',
+    '--out', '-o', '--frames', '--max-fragment-length', '--qr-version', '--grid', '--grid-gap', '--grid-padding', '--size', '--correction', '--format',
   ]);
   const aliases = { '-o': '--out' };
 
@@ -97,8 +101,92 @@ function positiveInteger(value, label) {
   return number;
 }
 
+function nonNegativeInteger(value, label) {
+  const number = Number(value);
+  if (!Number.isSafeInteger(number) || number < 0) {
+    throw new Error(`${label} must be a non-negative safe integer.`);
+  }
+  return number;
+}
+
+function parseGrid(value) {
+  const match = /^(\d+)x(\d+)$/i.exec(String(value));
+  if (!match) throw new Error('--grid must have the form NxM, e.g. 3x3.');
+  const columns = positiveInteger(match[1], '--grid columns');
+  const rows = positiveInteger(match[2], '--grid rows');
+  if (!Number.isSafeInteger(columns * rows)) {
+    throw new Error('--grid dimensions are too large.');
+  }
+  return { columns, rows };
+}
+
+/** Compose QR images into a white, row-major grid page. */
+function composeGridPage(images, { size, columns, rows, gap, padding }) {
+  const pageWidth = columns * size + (columns - 1) * gap + 2 * padding;
+  const pageHeight = rows * size + (rows - 1) * gap + 2 * padding;
+  const pixelLength = pageWidth * pageHeight * 4;
+  if (!Number.isSafeInteger(pixelLength)) {
+    throw new Error('Grid page dimensions are too large.');
+  }
+  if (images.length > columns * rows) {
+    throw new Error('Too many QR images for one grid page.');
+  }
+
+  const pixels = new Uint8Array(pixelLength);
+  pixels.fill(255);
+  const rowBytes = size * 4;
+
+  for (let index = 0; index < images.length; index += 1) {
+    const image = images[index];
+    if (image.width !== size || image.height !== size) {
+      throw new Error('All QR images in a grid must have the configured size.');
+    }
+    const column = index % columns;
+    const row = Math.floor(index / columns);
+    const destinationX = padding + column * (size + gap);
+    const destinationY = padding + row * (size + gap);
+
+    for (let y = 0; y < size; y += 1) {
+      const sourceStart = y * rowBytes;
+      const destinationStart = ((destinationY + y) * pageWidth + destinationX) * 4;
+      pixels.set(
+        image.pixels.subarray(sourceStart, sourceStart + rowBytes),
+        destinationStart,
+      );
+    }
+  }
+
+  return new RenderedImage({ width: pageWidth, height: pageHeight, pixels });
+}
+
 function sha256(bytes) {
   return createHash('sha256').update(bytes).digest('hex');
+}
+
+function cborByteStringHeaderLength(length) {
+  if (length < 24) return 1;
+  if (length <= 0xff) return 2;
+  if (length <= 0xffff) return 3;
+  if (length <= 0xffffffff) return 5;
+  return 9;
+}
+
+/** Size the padded page payload so its CBOR byte string is exactly K MUR fragments. */
+function calculatePageChunkCapacity(maxFragmentLength, dataFramesPerPage) {
+  const targetLength = maxFragmentLength * dataFramesPerPage;
+  if (!Number.isSafeInteger(targetLength)) throw new Error('Page fragment capacity is too large.');
+  let chunkCapacity = targetLength - PAGE_ENVELOPE_HEADER_LENGTH - 9;
+  for (let iteration = 0; iteration < 10; iteration += 1) {
+    const envelopeLength = PAGE_ENVELOPE_HEADER_LENGTH + chunkCapacity;
+    const next = targetLength - PAGE_ENVELOPE_HEADER_LENGTH - cborByteStringHeaderLength(envelopeLength);
+    if (next === chunkCapacity) break;
+    chunkCapacity = next;
+  }
+  const envelopeLength = PAGE_ENVELOPE_HEADER_LENGTH + chunkCapacity;
+  if (chunkCapacity < 1 || envelopeLength + cborByteStringHeaderLength(envelopeLength) !== targetLength) {
+    throw new Error('Could not calculate a valid page payload size for this fragment length.');
+  }
+  return chunkCapacity;
 }
 
 const AUTO_FRAME_REDUNDANCY = 0.10;
@@ -237,6 +325,19 @@ async function encodeCommand(inputPath, options) {
   if (requestedQrVersion !== undefined && requestedQrVersion > 40) {
     throw new Error('--qr-version must be between 1 and 40.');
   }
+  const grid = options.grid === undefined ? undefined : parseGrid(options.grid);
+  const gridGap = options.grid_gap === undefined
+    ? 24
+    : nonNegativeInteger(options.grid_gap, '--grid-gap');
+  if (options.grid_gap !== undefined && grid === undefined) {
+    throw new Error('--grid-gap requires --grid.');
+  }
+  const gridPadding = options.grid_padding === undefined
+    ? 48
+    : nonNegativeInteger(options.grid_padding, '--grid-padding');
+  if (options.grid_padding !== undefined && grid === undefined) {
+    throw new Error('--grid-padding requires --grid.');
+  }
   const size = positiveInteger(options.size ?? '512', '--size');
   const correction = options.correction ?? 'medium';
   const format = options.format ?? 'both';
@@ -245,6 +346,12 @@ async function encodeCommand(inputPath, options) {
   }
   if (!['both', 'png', 'ur'].includes(format)) {
     throw new Error('--format must be both, png or ur.');
+  }
+  if (grid !== undefined && format === 'ur') {
+    throw new Error('--grid requires --format png or both.');
+  }
+  if (grid !== undefined && requestedFrameCount !== undefined) {
+    throw new Error('--frames cannot be used with --grid; page sessions use the grid capacity as their frame count.');
   }
 
   const input = await readFile(inputPath);
@@ -265,6 +372,129 @@ async function encodeCommand(inputPath, options) {
   if (existing.length > 0 && !options.force) {
     throw new Error(`Output directory is not empty: ${outputDirectory} (use --force to overwrite files).`);
   }
+  // A grid export is one independent Fountain session per printed page.
+  if (grid) {
+    const framesPerPage = grid.columns * grid.rows;
+    if (framesPerPage < 3) {
+      throw new Error('--grid needs at least 3 cells so each page can contain data and repair fragments.');
+    }
+    const repairFramesPerPage = Math.max(1, Math.round(framesPerPage / 3));
+    const dataFramesPerPage = framesPerPage - repairFramesPerPage;
+    if (dataFramesPerPage < 2) {
+      throw new Error('--grid must leave at least two data frames per page.');
+    }
+
+    const chunkCapacity = calculatePageChunkCapacity(maxFragmentLength, dataFramesPerPage);
+    const pageCount = Math.max(1, Math.ceil(inputBytes.byteLength / chunkCapacity));
+    if (pageCount > 0xffffffff) throw new Error('Page count exceeds the page-transfer format limit.');
+    const totalFrameCount = pageCount * framesPerPage;
+    const totalSourcePartCount = pageCount * dataFramesPerPage;
+    const fileHash = sha256(inputBytes);
+    const pageDigits = String(pageCount).length;
+    const frameDigits = String(framesPerPage).length;
+    let firstQrModules = null;
+
+    for (let pageIndex = 0; pageIndex < pageCount; pageIndex += 1) {
+      const chunkStart = pageIndex * chunkCapacity;
+      const chunkLength = Math.max(0, Math.min(chunkCapacity, inputBytes.byteLength - chunkStart));
+      const chunk = new Uint8Array(chunkCapacity);
+      chunk.set(inputBytes.subarray(chunkStart, chunkStart + chunkLength));
+      const envelope = createPageEnvelope({
+        pageIndex,
+        pageCount,
+        originalSize: inputBytes.byteLength,
+        chunkLength,
+        chunk,
+        fileSha256: fileHash,
+      });
+      const pageEncoder = new FileEncoder(envelope, { maxFragmentLength });
+      if (pageEncoder.isSinglePart || pageEncoder.sourcePartCount !== dataFramesPerPage) {
+        throw new Error(
+          `Internal page sizing error: page ${pageIndex + 1} has ${pageEncoder.sourcePartCount} ` +
+          `source fragments; expected ${dataFramesPerPage}.`,
+        );
+      }
+      const pageFragments = pageEncoder.take(framesPerPage);
+      if (pageFragments.length !== framesPerPage) {
+        throw new Error(`Page ${pageIndex + 1} did not produce ${framesPerPage} frames.`);
+      }
+
+      const pageImages = [];
+      for (let frameIndex = 0; frameIndex < pageFragments.length; frameIndex += 1) {
+        const fragment = pageFragments[frameIndex];
+        const modules = qrModulesForFragment(fragment, correction, requestedQrVersion);
+        if (requestedQrVersion !== undefined && modules !== 17 + 4 * requestedQrVersion) {
+          throw new Error(`Page ${pageIndex + 1}, frame ${frameIndex + 1} does not fit QR version ${requestedQrVersion}.`);
+        }
+        if (firstQrModules === null) firstQrModules = modules;
+
+        const pageStem = `page-${String(pageIndex + 1).padStart(pageDigits, '0')}`;
+        const frameStem = `${pageStem}-frame-${String(frameIndex + 1).padStart(frameDigits, '0')}`;
+        if (format === 'both') {
+          await writeFile(join(outputDirectory, `${frameStem}.ur.txt`), `${fragment}\n`, 'utf8');
+        }
+
+        const image = requestedQrVersion === undefined
+          ? renderUrQr(fragment, { size, correction })
+          : renderFixedUrQr(fragment, { size, correction, version: requestedQrVersion });
+        pageImages.push(image);
+      }
+
+      const pageImage = composeGridPage(pageImages, {
+        size,
+        columns: grid.columns,
+        rows: grid.rows,
+        gap: gridGap,
+        padding: gridPadding,
+      });
+      const pageName = `page-${String(pageIndex + 1).padStart(pageDigits, '0')}.png`;
+      await writeFile(join(outputDirectory, pageName), pageImage.toPng());
+    }
+
+    const actualQrVersion = (firstQrModules - 17) / 4;
+    const manifest = {
+      format: 'MUR-PAGES',
+      fountainScope: 'page',
+      urType: 'bytes',
+      originalFilename: basename(inputPath),
+      originalSize: input.byteLength,
+      sha256: fileHash,
+      frameCount: totalFrameCount,
+      sourcePartCount: totalSourcePartCount,
+      sourcePartCountPerPage: dataFramesPerPage,
+      repairFramesPerPage,
+      maxFragmentLength,
+      qr: { size, correction, version: actualQrVersion, modules: firstQrModules },
+      grid: {
+        columns: grid.columns,
+        rows: grid.rows,
+        gap: gridGap,
+        padding: gridPadding,
+        framesPerPage,
+        pageCount,
+        dataFramesPerPage,
+        repairFramesPerPage,
+        ordering: 'row-major',
+        fountainScope: 'page',
+      },
+      generatedBy: `murfile/${VERSION}`,
+      protocol: 'Blockchain Commons BCR-2020-005 + BCR-2024-001',
+    };
+    await writeFile(join(outputDirectory, 'manifest.json'), `${JSON.stringify(manifest, null, 2)}\n`, 'utf8');
+
+    console.log(`Encoded: ${inputPath}`);
+    console.log(`Bytes:   ${input.byteLength}`);
+    console.log(`SHA-256: ${manifest.sha256}`);
+    console.log(`Pages:   ${pageCount}`);
+    console.log(`Frames:  ${totalFrameCount} (${framesPerPage} per page)`);
+    console.log(`Output:  ${outputDirectory}`);
+    console.log(`Format:  ${format}`);
+    console.log(`QR:      version ${actualQrVersion} (${firstQrModules} modules)`);
+    console.log(`Grid:    ${grid.columns}x${grid.rows}, ${pageCount} independent Fountain sessions`);
+    console.log(`Per page: ${dataFramesPerPage} source + ${repairFramesPerPage} repair frames`);
+    return;
+  }
+
   if (!encoder.isSinglePart && frameCount < encoder.sourcePartCount) {
     throw new Error(`--frames must be at least ${encoder.sourcePartCount} for this file; increase it for loss tolerance.`);
   }
@@ -287,18 +517,52 @@ async function encodeCommand(inputPath, options) {
 
   const actualQrVersion = (firstQrModules - 17) / 4;
   const width = String(frameCount).length;
-  for (let index = 0; index < fragments.length; index += 1) {
-    const stem = `frame-${String(index + 1).padStart(width, '0')}`;
-    const fragment = fragments[index];
+  const framesPerPage = grid ? grid.columns * grid.rows : 1;
+  const pageCount = grid ? Math.ceil(frameCount / framesPerPage) : 0;
 
-    if (format === 'both' || format === 'ur') {
-      await writeFile(join(outputDirectory, `${stem}.ur.txt`), `${fragment}\n`, 'utf8');
+  const renderFragment = (fragment) => requestedQrVersion === undefined
+    ? renderUrQr(fragment, { size, correction })
+    : renderFixedUrQr(fragment, { size, correction, version: requestedQrVersion });
+
+  if (grid) {
+    const pageDigits = String(pageCount).length;
+    for (let pageIndex = 0; pageIndex < pageCount; pageIndex += 1) {
+      const pageImages = [];
+      const start = pageIndex * framesPerPage;
+      const end = Math.min(start + framesPerPage, fragments.length);
+
+      for (let index = start; index < end; index += 1) {
+        const stem = `frame-${String(index + 1).padStart(width, '0')}`;
+        const fragment = fragments[index];
+
+        if (format === 'both') {
+          await writeFile(join(outputDirectory, `${stem}.ur.txt`), `${fragment}\n`, 'utf8');
+        }
+        pageImages.push(renderFragment(fragment));
+      }
+
+      const page = composeGridPage(pageImages, {
+        size,
+        columns: grid.columns,
+        rows: grid.rows,
+        gap: gridGap,
+        padding: gridPadding,
+      });
+      const pageName = `page-${String(pageIndex + 1).padStart(pageDigits, '0')}.png`;
+      await writeFile(join(outputDirectory, pageName), page.toPng());
     }
-    if (format === 'both' || format === 'png') {
-      const image = requestedQrVersion === undefined
-        ? renderUrQr(fragment, { size, correction })
-        : renderFixedUrQr(fragment, { size, correction, version: requestedQrVersion });
-      await writeFile(join(outputDirectory, `${stem}.png`), image.toPng());
+  } else {
+    for (let index = 0; index < fragments.length; index += 1) {
+      const stem = `frame-${String(index + 1).padStart(width, '0')}`;
+      const fragment = fragments[index];
+
+      if (format === 'both' || format === 'ur') {
+        await writeFile(join(outputDirectory, `${stem}.ur.txt`), `${fragment}\n`, 'utf8');
+      }
+      if (format === 'both' || format === 'png') {
+        const image = renderFragment(fragment);
+        await writeFile(join(outputDirectory, `${stem}.png`), image.toPng());
+      }
     }
   }
 
@@ -317,6 +581,15 @@ async function encodeCommand(inputPath, options) {
       version: actualQrVersion,
       modules: firstQrModules,
     },
+    grid: grid ? {
+      columns: grid.columns,
+      rows: grid.rows,
+      gap: gridGap,
+      padding: gridPadding,
+      framesPerPage,
+      pageCount,
+      ordering: 'row-major',
+    } : null,
     generatedBy: `murfile/${VERSION}`,
     protocol: 'Blockchain Commons BCR-2020-005 + BCR-2024-001',
   };
@@ -329,6 +602,7 @@ async function encodeCommand(inputPath, options) {
   console.log(`Output:  ${outputDirectory}`);
   console.log(`Format:  ${format}`);
   console.log(`QR:      version ${actualQrVersion} (${firstQrModules} modules)`);
+  if (grid) console.log(`Grid:    ${grid.columns}x${grid.rows}, ${pageCount} pages, ${gridGap}px gap, ${gridPadding}px padding`);
   if (!encoder.isSinglePart) console.log(`Source fragments: ${encoder.sourcePartCount}; exported fragments include fountain redundancy.`);
 }
 
@@ -406,11 +680,16 @@ async function decodeCommand(inputPath, options) {
   }
 
   const bytes = decoder.result;
+  const actualHash = sha256(bytes);
+  if (status.expectedSha256 && actualHash !== status.expectedSha256) {
+    throw new Error(`Reconstructed file hash mismatch: expected ${status.expectedSha256}, got ${actualHash}.`);
+  }
   await atomicWrite(options.out, bytes);
   console.log(`Decoded: ${options.out}`);
   console.log(`Bytes:   ${bytes.byteLength}`);
-  console.log(`SHA-256: ${sha256(bytes)}`);
+  console.log(`SHA-256: ${actualHash}`);
   console.log(`URs:     ${totalCandidates} read`);
+  if (status.pageCount !== null) console.log(`Pages:   ${status.completedPages}/${status.pageCount} independently reconstructed`);
 }
 
 async function inspectCommand(inputPath, options) {
@@ -428,6 +707,11 @@ async function inspectCommand(inputPath, options) {
     redundantFragments: status.redundantFragments,
     invalidUris: status.invalidUris,
     reconstructedBytes: decoder.result?.byteLength ?? null,
+    completedPages: status.completedPages,
+    pageCount: status.pageCount,
+    missingPages: status.missingPages,
+    activeSessions: status.activeSessions,
+    expectedSha256: status.expectedSha256,
   };
 
   if (options.json) console.log(JSON.stringify(result, null, 2));

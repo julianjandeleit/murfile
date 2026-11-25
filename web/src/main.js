@@ -18,6 +18,7 @@ const elements = {
   transferSubtitle: $('transferSubtitle'),
   decodeProgress: $('decodeProgress'),
   progressLabel: $('progressLabel'),
+  pageProgressLabel: $('pageProgressLabel'),
   fragmentCount: $('fragmentCount'),
   duplicateCount: $('duplicateCount'),
   qrCount: $('qrCount'),
@@ -106,6 +107,11 @@ function renderCounters() {
   elements.qrCount.textContent = String(decodedQrCount);
   elements.decodeProgress.value = status.progress;
   elements.progressLabel.textContent = `${Math.round(status.progress * 100)} %`;
+  elements.pageProgressLabel.hidden = status.pageCount === null;
+  if (status.pageCount !== null) {
+    elements.pageProgressLabel.textContent = `Seiten rekonstruiert: ${status.completedPages} / ${status.pageCount} · ` +
+      `${status.missingPages.length} noch offen · ${status.activeSessions} aktive Sessions`;
+  }
 }
 
 function resetSession() {
@@ -115,6 +121,8 @@ function resetSession() {
   recentEvents = [];
   elements.eventList.innerHTML = '<li class="empty-event">Noch keine QR-Codes erkannt.</li>';
   elements.eventCount.textContent = '0';
+  elements.pageProgressLabel.hidden = true;
+  elements.pageProgressLabel.textContent = '';
   elements.resultEmpty.hidden = false;
   elements.resultContent.hidden = true;
   elements.filenameInput.value = 'recovered.bin';
@@ -298,7 +306,17 @@ async function showCompletedFile(bytes) {
   setTransferState('Datei vollständig rekonstruiert', `${formatBytes(completedFile.byteLength)} erfolgreich aus UR rekonstruiert.`, 'complete');
   addEvent(`Datei rekonstruiert (${formatBytes(completedFile.byteLength)}).`, 'success');
   try {
-    elements.hashValue.textContent = await sha256Hex(completedFile);
+    const actualHash = await sha256Hex(completedFile);
+    const expectedHash = session.status.expectedSha256;
+    if (expectedHash && actualHash !== 'Nicht verfügbar' && actualHash !== expectedHash) {
+      completedFile = null;
+      setTransferState('Integritätsprüfung fehlgeschlagen', 'Der SHA-256-Hash stimmt nicht mit den Seitendaten überein.', 'error');
+      addEvent('Datei-Hash stimmt nicht überein; Download gesperrt.', 'error');
+      elements.hashValue.textContent = 'Hash stimmt nicht überein';
+      renderCounters();
+      return;
+    }
+    elements.hashValue.textContent = actualHash;
   } catch {
     elements.hashValue.textContent = 'Nicht verfügbar';
   }
@@ -312,12 +330,20 @@ function handleQrTexts(texts) {
     const result = session.add(text);
     if (result.kind === 'fragment') {
       const progress = Math.round(result.status.progress * 100);
-      setTransferState('MUR-Fragmente werden gesammelt', `${result.status.fragmentsReceived} Fragmente · ${progress} % Decodierfortschritt`, 'receiving');
+      const detail = result.status.pageCount !== null
+        ? `${result.status.completedPages}/${result.status.pageCount} Seiten vollständig · ${progress} %`
+        : `${result.status.fragmentsReceived} Fragmente · ${progress} % Decodierfortschritt`;
+      setTransferState('MUR-Fragmente werden gesammelt', detail, 'receiving');
       addEvent(`MUR-Fragment empfangen (${result.status.fragmentsReceived}).`, 'normal');
-    } else if (result.kind === 'redundant') {
-      // The fountain decoder received a valid fragment that added no new rank.
-    } else if (result.kind === 'duplicate') {
-      // Repeated camera detections are expected; do not flood the event log.
+    } else if (result.kind === 'page-complete') {
+      setTransferState(
+        'Seite rekonstruiert',
+        `Seite ${result.pageIndex + 1} von ${result.pageCount} vollständig.`,
+        'receiving',
+      );
+      addEvent(`Seite ${result.pageIndex + 1}/${result.pageCount} rekonstruiert.`, 'success');
+    } else if (result.kind === 'redundant' || result.kind === 'duplicate' || result.kind === 'duplicate-page') {
+      // Repeated camera detections and already completed fountain sessions are expected.
     } else if (result.kind === 'invalid') {
       addEvent(`UR verworfen: ${result.message}`, 'warning');
       if (!session.complete) setTransferState('Ungültige UR erkannt', result.message, 'error');

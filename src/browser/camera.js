@@ -34,27 +34,106 @@ export async function requestCameraStream(selectedCameraId = '', {
   const constraints = selectedCameraId
     ? {
       deviceId: { exact: selectedCameraId },
-      width: { ideal: 1920 },
-      height: { ideal: 1080 },
-      frameRate: { ideal: 24, max: 30 },
+      width: { ideal: 3840 },
+      height: { ideal: 2160 },
     }
     : {
       facingMode: { ideal: 'environment' },
-      width: { ideal: 1920 },
-      height: { ideal: 1080 },
-      frameRate: { ideal: 24, max: 30 },
+      width: { ideal: 3840 },
+      height: { ideal: 2160 },
     };
 
+  let stream;
   try {
-    return await navigator.mediaDevices.getUserMedia({ audio: false, video: constraints });
+    stream = await navigator.mediaDevices.getUserMedia({ audio: false, video: constraints });
   } catch (firstError) {
     try {
       const fallback = selectedCameraId
         ? { deviceId: { exact: selectedCameraId } }
-        : { facingMode: 'environment' };
-      return await navigator.mediaDevices.getUserMedia({ audio: false, video: fallback });
-    } catch {
-      throw firstError;
+        : { facingMode: { ideal: 'environment' } };
+      stream = await navigator.mediaDevices.getUserMedia({ audio: false, video: fallback });
+    } catch (fallbackError) {
+      throw new AggregateError(
+        [firstError, fallbackError],
+        `Could not start the selected camera at its best available resolution: ${fallbackError.message}`,
+      );
     }
   }
+
+  const track = stream.getVideoTracks()[0];
+  if (!track) {
+    stream.getTracks().forEach((item) => item.stop());
+    throw new Error('The selected media source did not provide a video track.');
+  }
+  const capabilities = track.getCapabilities?.();
+  const current = track.getSettings?.() ?? {};
+  const maxWidth = capabilities?.width?.max;
+  const maxHeight = capabilities?.height?.max;
+  const candidates = new Map();
+  const addCandidate = (width, height) => {
+    const w = Math.floor(width / 2) * 2;
+    const h = Math.floor(height / 2) * 2;
+    if (w >= (capabilities?.width?.min ?? 1) &&
+        h >= (capabilities?.height?.min ?? 1) &&
+        (!Number.isFinite(maxWidth) || w <= maxWidth) &&
+        (!Number.isFinite(maxHeight) || h <= maxHeight)) {
+      candidates.set(`${w}x${h}`, { width: w, height: h });
+    }
+  };
+  if (Number.isFinite(maxWidth) && Number.isFinite(maxHeight)) {
+    addCandidate(maxWidth, maxHeight);
+    for (const aspect of [
+      current.width && current.height ? current.width / current.height : 16 / 9,
+      16 / 9,
+      4 / 3,
+      3 / 2,
+    ]) {
+      const width = Math.min(maxWidth, maxHeight * aspect);
+      addCandidate(width, width / aspect);
+    }
+    for (const [width, height] of [
+      [7680, 4320], [4096, 2160], [3840, 2160], [2560, 1440],
+      [1920, 1080], [1280, 720], [640, 480],
+    ]) {
+      addCandidate(width, height);
+    }
+  }
+
+  const resolutionCandidates = [...candidates.values()]
+    .filter(({ width, height }) => width !== current.width || height !== current.height)
+    .sort((a, b) => b.width * b.height - a.width * a.height);
+  let resolutionWarning = '';
+  if (resolutionCandidates.length && typeof track.applyConstraints !== 'function') {
+    resolutionWarning = 'This browser cannot request a higher camera resolution.';
+  }
+  for (const candidate of resolutionCandidates) {
+    if (typeof track.applyConstraints !== 'function') break;
+    try {
+      await track.applyConstraints({
+        width: { exact: candidate.width },
+        height: { exact: candidate.height },
+      });
+      break;
+    } catch (error) {
+      if (error?.name !== 'OverconstrainedError' && error?.name !== 'NotSupportedError') {
+        stream.getTracks().forEach((item) => item.stop());
+        throw error;
+      }
+      resolutionWarning = `Could not select ${candidate.width}×${candidate.height}; trying the next supported resolution.`;
+    }
+  }
+
+  const settings = track.getSettings?.() ?? {};
+  if (Number.isFinite(maxWidth) && Number.isFinite(maxHeight) &&
+      settings.width < maxWidth && settings.height < maxHeight && !resolutionWarning) {
+    resolutionWarning = 'The camera did not select its reported maximum resolution.';
+  }
+  const resolution = {
+    width: settings.width ?? 0,
+    height: settings.height ?? 0,
+    maxWidth: Number.isFinite(maxWidth) ? maxWidth : null,
+    maxHeight: Number.isFinite(maxHeight) ? maxHeight : null,
+    warning: resolutionWarning,
+  };
+  return { stream, resolution };
 }

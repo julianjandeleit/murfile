@@ -1,7 +1,6 @@
 import { FileEncoder } from './encoder.js';
-import { encodePageFragments } from './page-fountain.js';
 import {
-  chooseMaxFragmentLength,
+  chooseSymbolSize,
   composeGridPage,
   qrModulesForFragment,
   renderQrFragment,
@@ -12,37 +11,18 @@ import {
   SOUNDBOOK_CHUNK_HEADER_LENGTH,
 } from './soundbook-transfer.js';
 
-function cborByteStringHeaderLength(length) {
-  if (length < 24) return 1;
-  if (length <= 0xff) return 2;
-  if (length <= 0xffff) return 3;
-  if (length <= 0xffffffff) return 5;
-  return 9;
-}
-
-function calculateChunkCapacity(maxFragmentLength, dataFramesPerPage) {
-  const targetLength = maxFragmentLength * dataFramesPerPage;
-  if (!Number.isSafeInteger(targetLength)) throw new Error('Soundbook page capacity is too large.');
-  let chunkCapacity = targetLength - SOUNDBOOK_CHUNK_HEADER_LENGTH - 9;
-  for (let iteration = 0; iteration < 10; iteration += 1) {
-    const envelopeLength = SOUNDBOOK_CHUNK_HEADER_LENGTH + chunkCapacity;
-    const next = targetLength - SOUNDBOOK_CHUNK_HEADER_LENGTH - cborByteStringHeaderLength(envelopeLength);
-    if (next === chunkCapacity) break;
-    chunkCapacity = next;
+function repairSymbolCount(framesPerPage, profile, requestedRepairSymbols) {
+  if (requestedRepairSymbols !== undefined) {
+    if (!Number.isSafeInteger(requestedRepairSymbols) ||
+        requestedRepairSymbols < 1 || requestedRepairSymbols >= framesPerPage) {
+      throw new RangeError('repairSymbols must be less than the number of grid cells.');
+    }
+    return requestedRepairSymbols;
   }
-  const envelopeLength = SOUNDBOOK_CHUNK_HEADER_LENGTH + chunkCapacity;
-  if (chunkCapacity < 1 ||
-      envelopeLength + cborByteStringHeaderLength(envelopeLength) !== targetLength) {
-    throw new Error('Could not calculate a valid Soundbook page payload size.');
-  }
-  return chunkCapacity;
-}
-
-function repairFrameCount(framesPerPage, profile) {
   if (profile === 'minimal') return 1;
   if (profile === 'low') return Math.max(1, Math.ceil(framesPerPage / 4));
-  if (profile === 'default') return Math.max(1, Math.round(framesPerPage / 3));
-  throw new Error('Page redundancy must be minimal, low or default.');
+  if (profile === 'default') return Math.max(1, Math.round(framesPerPage * 2 / 16));
+  throw new Error('RaptorQ redundancy must be minimal, low or default.');
 }
 
 /** Calculate transport settings for exact, contiguous chunks of an Ogg Opus source. */
@@ -54,10 +34,11 @@ export function createSoundbookPagePlan(audioBytes, {
   rows = 4,
   size = 512,
   correction = 'low',
-  qrVersion = 20,
+  qrVersion = 21,
   gap = 24,
   padding = 48,
-  redundancy = 'minimal',
+  redundancy = 'default',
+  repairSymbols: requestedRepairSymbols,
   chunkHashes,
 } = {}) {
   if (!(audioBytes instanceof Uint8Array) || audioBytes.byteLength === 0) {
@@ -77,20 +58,16 @@ export function createSoundbookPagePlan(audioBytes, {
   if (!Number.isSafeInteger(framesPerPage) || framesPerPage > 255) {
     throw new RangeError('Soundbook grids support at most 255 QR cells.');
   }
-  const repairFramesPerPage = repairFrameCount(framesPerPage, redundancy);
+  const repairFramesPerPage = repairSymbolCount(framesPerPage, redundancy, requestedRepairSymbols);
   const dataFramesPerPage = framesPerPage - repairFramesPerPage;
   if (dataFramesPerPage < 2) {
     throw new Error('The Soundbook grid must leave at least two data frames per page.');
   }
 
-  const maxFragmentLength = chooseMaxFragmentLength(
-    new Uint8Array(4096),
-    correction,
-    qrVersion,
-    framesPerPage,
-    dataFramesPerPage,
-  );
-  const chunkCapacity = calculateChunkCapacity(maxFragmentLength, dataFramesPerPage);
+  const symbolSize = chooseSymbolSize(correction, qrVersion);
+  const blockCapacity = dataFramesPerPage * symbolSize;
+  const chunkCapacity = blockCapacity - SOUNDBOOK_CHUNK_HEADER_LENGTH;
+  if (chunkCapacity < 1) throw new Error('QR capacity is too small for the Soundbook page envelope.');
   const pageCount = Math.max(1, Math.ceil(audioBytes.byteLength / chunkCapacity));
   if (pageCount > MAX_SOUNDBOOK_PAGES) {
     throw new Error(`Soundbook page count exceeds the limit of ${MAX_SOUNDBOOK_PAGES}.`);
@@ -118,11 +95,12 @@ export function createSoundbookPagePlan(audioBytes, {
     framesPerPage,
     repairFramesPerPage,
     dataFramesPerPage,
-    maxFragmentLength,
+    symbolSize,
     chunkCapacity,
     pageCount,
     manifest: {
-      format: 'SOUNDBOOK-3',
+      format: 'SOUNDBOOK-4',
+      transport: 'MQR1',
       bookId,
       codec: 'ogg-opus',
       audioLength: audioBytes.byteLength,
@@ -130,21 +108,19 @@ export function createSoundbookPagePlan(audioBytes, {
       durationMicros,
       pageCount,
       frameCount: pageCount * framesPerPage,
-      sourcePartCount: pageCount * dataFramesPerPage,
-      maxFragmentLength,
+      sourceSymbolCount: pageCount * dataFramesPerPage,
+      symbolSize,
       pagePayloadBytes: chunkCapacity,
       byteExact: true,
-      urType: 'murpage',
       qr: { version: qrVersion, correction, size },
       grid: {
         columns,
         rows,
         framesPerPage,
-        dataFramesPerPage,
-        repairFramesPerPage,
-        redundancy,
-        pageCode: 'vandermonde-gf256-v1',
-        guaranteedErasures: repairFramesPerPage,
+        sourceSymbols: dataFramesPerPage,
+        repairSymbols: repairFramesPerPage,
+        pageCode: 'raptorq-rfc6330',
+        recoveryModel: 'probabilistic',
         gap,
         padding,
         ordering: 'row-major',
@@ -154,7 +130,7 @@ export function createSoundbookPagePlan(audioBytes, {
   };
 }
 
-/** Render and MDS-encode one contiguous byte chunk from the original audio. */
+/** Render and RaptorQ-encode one contiguous byte chunk from the original audio. */
 export function encodeSoundbookPage(audioBytes, plan, pageIndex) {
   if (!(audioBytes instanceof Uint8Array) || audioBytes.byteLength !== plan.audioLength) {
     throw new TypeError('audioBytes do not match the Soundbook page plan.');
@@ -182,17 +158,13 @@ export function encodeSoundbookPage(audioBytes, plan, pageIndex) {
     chunkSha256: plan.chunkHashes[pageIndex],
     chunk,
   });
-  const { fragments, sourcePartCount } = encodePageFragments(
-    envelope,
-    plan.maxFragmentLength,
-    plan.framesPerPage,
-  );
-  if (sourcePartCount !== plan.dataFramesPerPage) {
-    throw new Error(
-      `Soundbook page sizing error: expected ${plan.dataFramesPerPage} source fragments, ` +
-      `got ${sourcePartCount}.`,
-    );
-  }
+  const pageEncoder = new FileEncoder(envelope, {
+    symbolSize: plan.symbolSize,
+    sourceSymbols: plan.dataFramesPerPage,
+    repairSymbols: plan.repairFramesPerPage,
+  });
+  if (pageEncoder.pageCount !== 1) throw new Error('Soundbook chunk exceeded its RaptorQ page capacity.');
+  const fragments = pageEncoder.take(plan.framesPerPage);
   if (fragments.length !== plan.framesPerPage) {
     throw new Error(`Soundbook page ${pageIndex + 1} did not produce ${plan.framesPerPage} fragments.`);
   }

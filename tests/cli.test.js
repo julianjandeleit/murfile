@@ -1,21 +1,20 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { spawnSync } from 'node:child_process';
+import { readFileSync } from 'node:fs';
 import { mkdtemp, readFile, readdir, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { randomBytes, createHash } from 'node:crypto';
-import { FileEncoder } from '../src/index.js';
-import { renderUrQr } from '@blockchaincommons/multipart-ur';
-import { encodeQr as encodeFixedQr } from '../src/vendor/qr-fixed.js';
+import { parseMqrFrame } from '../src/index.js';
+import { qrModulesForFragment } from '../src/qr-grid.js';
 
 const cliPath = new URL('../bin/murfile.js', import.meta.url);
 
-function runCli(args, options = {}) {
+function runCli(args) {
   return spawnSync(process.execPath, [cliPath.pathname, ...args], {
     encoding: 'utf8',
     timeout: 60_000,
-    ...options,
   });
 }
 
@@ -23,136 +22,42 @@ function hash(bytes) {
   return createHash('sha256').update(bytes).digest('hex');
 }
 
-test('CLI encode/decode roundtrip using exported UR text files', async () => {
+test('CLI defaults to MQR1, QR21-L, and a 4x4 grid and roundtrips bytes', async () => {
   const directory = await mkdtemp(join(tmpdir(), 'murfile-cli-'));
   try {
     const sourcePath = join(directory, 'sample.bin');
     const framesDirectory = join(directory, 'frames');
     const outputPath = join(directory, 'recovered.bin');
-    const original = randomBytes(1200);
+    const original = randomBytes(1800);
     await writeFile(sourcePath, original);
 
-    const encoded = runCli([
-      'encode', sourcePath,
-      '--out', framesDirectory,
-      '--frames', '80',
-      '--max-fragment-length', '96',
-      '--format', 'ur',
-    ]);
-    assert.equal(encoded.status, 0, encoded.stderr || encoded.stdout);
-
-    const decoded = runCli(['decode', framesDirectory, '--out', outputPath]);
-    assert.equal(decoded.status, 0, decoded.stderr || decoded.stdout);
-    const recovered = await readFile(outputPath);
-    assert.equal(hash(recovered), hash(original));
-  } finally {
-    await rm(directory, { recursive: true, force: true });
-  }
-});
-
-test('CLI automatically selects QR-fitting fragments and adds frame redundancy', async () => {
-  const directory = await mkdtemp(join(tmpdir(), 'murfile-auto-'));
-  try {
-    const sourcePath = join(directory, 'sample.bin');
-    const framesDirectory = join(directory, 'frames');
-    const outputPath = join(directory, 'recovered.bin');
-    const original = randomBytes(24_000);
-    await writeFile(sourcePath, original);
-
-    const encoded = runCli([
-      'encode', sourcePath,
-      '--out', framesDirectory,
-      '--format', 'ur',
-    ]);
+    const encoded = runCli(['encode', sourcePath, '--out', framesDirectory]);
     assert.equal(encoded.status, 0, encoded.stderr || encoded.stdout);
 
     const manifest = JSON.parse(await readFile(join(framesDirectory, 'manifest.json'), 'utf8'));
-    assert.ok(manifest.maxFragmentLength > 100);
-    assert.ok(manifest.sourcePartCount > 1);
-    assert.equal(manifest.frameCount, Math.ceil(manifest.sourcePartCount * 1.1));
-
-    const firstStem = `frame-${String(1).padStart(String(manifest.frameCount).length, '0')}`;
-    const firstFragment = (await readFile(join(framesDirectory, `${firstStem}.ur.txt`), 'utf8')).trim();
-    assert.doesNotThrow(() => renderUrQr(firstFragment, { size: 256, correction: 'medium' }));
-
-    const decoded = runCli(['decode', framesDirectory, '--out', outputPath]);
-    assert.equal(decoded.status, 0, decoded.stderr || decoded.stdout);
-    assert.equal(hash(await readFile(outputPath)), hash(original));
-  } finally {
-    await rm(directory, { recursive: true, force: true });
-  }
-});
-
-test('CLI forces every emitted QR to the requested matrix version', async () => {
-  const directory = await mkdtemp(join(tmpdir(), 'murfile-fixed-version-'));
-  try {
-    const sourcePath = join(directory, 'sample.bin');
-    const framesDirectory = join(directory, 'frames');
-    const original = randomBytes(8000);
-    const targetVersion = 10;
-    const expectedModules = 17 + 4 * targetVersion;
-    await writeFile(sourcePath, original);
-
-    const encoded = runCli([
-      'encode', sourcePath,
-      '--out', framesDirectory,
-      '--qr-version', String(targetVersion),
-      '--format', 'both',
-    ]);
-    assert.equal(encoded.status, 0, encoded.stderr || encoded.stdout);
-
-    const manifest = JSON.parse(await readFile(join(framesDirectory, 'manifest.json'), 'utf8'));
-    assert.ok(manifest.sourcePartCount > 1);
-    assert.equal(manifest.qr.version, targetVersion);
-    assert.equal(manifest.qr.modules, expectedModules);
-
-    const frameDigits = String(manifest.frameCount).length;
-    for (let index = 1; index <= manifest.frameCount; index += 1) {
-      const stem = `frame-${String(index).padStart(frameDigits, '0')}`;
-      const fragment = (await readFile(join(framesDirectory, `${stem}.ur.txt`), 'utf8')).trim();
-      const symbol = encodeFixedQr(new TextEncoder().encode(fragment.toUpperCase()), 'M', targetVersion);
-      assert.equal(symbol.width, expectedModules, `${stem} should use QR version ${targetVersion}`);
-    }
-
-    const firstStem = `frame-${String(1).padStart(frameDigits, '0')}`;
-    const png = await readFile(join(framesDirectory, `${firstStem}.png`));
-    assert.deepEqual(Array.from(png.subarray(0, 8)), [137, 80, 78, 71, 13, 10, 26, 10]);
-  } finally {
-    await rm(directory, { recursive: true, force: true });
-  }
-});
-
-test('CLI keeps one global fountain session when exporting a grid', async () => {
-  const directory = await mkdtemp(join(tmpdir(), 'murfile-global-grid-'));
-  try {
-    const sourcePath = join(directory, 'sample.bin');
-    const framesDirectory = join(directory, 'frames');
-    const outputPath = join(directory, 'recovered.bin');
-    const original = randomBytes(4000);
-    await writeFile(sourcePath, original);
-
-    const encoded = runCli([
-      'encode', sourcePath,
-      '--out', framesDirectory,
-      '--max-fragment-length', '100',
-      '--size', '128',
-      '--grid', '2x2',
-      '--format', 'both',
-    ]);
-    assert.equal(encoded.status, 0, encoded.stderr || encoded.stdout);
-
-    const manifest = JSON.parse(await readFile(join(framesDirectory, 'manifest.json'), 'utf8'));
-    assert.equal(manifest.fountainScope, 'global');
-    assert.equal(manifest.grid.fountainScope, 'global');
-    assert.ok(manifest.frameCount > manifest.sourcePartCount);
-    assert.equal(manifest.grid.pageCount, Math.ceil(manifest.frameCount / 4));
+    assert.equal(manifest.format, 'MQR1');
+    assert.equal(manifest.originalSize, original.byteLength);
+    assert.equal(manifest.sha256, hash(original));
+    assert.deepEqual(
+      [manifest.qr.version, manifest.qr.correction, manifest.grid.columns, manifest.grid.rows],
+      [21, 'low', 4, 4],
+    );
+    assert.equal(manifest.grid.framesPerPage, 16);
+    assert.equal(manifest.grid.sourceSymbols, 14);
+    assert.equal(manifest.grid.repairSymbols, 2);
 
     const files = await readdir(framesDirectory);
-    const pageFiles = files.filter((file) => /^page-\d+\.png$/.test(file));
-    const urFiles = files.filter((file) => /^frame-\d+\.ur\.txt$/.test(file));
-    assert.equal(pageFiles.length, manifest.grid.pageCount);
-    assert.equal(urFiles.length, manifest.frameCount);
-    assert.equal(files.some((file) => /^page-\d+-frame-\d+\.ur\.txt$/.test(file)), false);
+    const frameFiles = files.filter((file) => /\.mqr\.txt$/.test(file)).sort();
+    assert.equal(frameFiles.length, manifest.frameCount);
+    assert.equal(files.filter((file) => /\.png$/.test(file)).length, manifest.pageCount);
+    const repairPositions = frameFiles.flatMap((file, index) => {
+      const frame = readFileSync(join(framesDirectory, file), 'utf8').replace(/\r?\n$/, '');
+      return parseMqrFrame(frame).encodingSymbolId >= manifest.grid.sourceSymbols ? [index] : [];
+    });
+    assert.deepEqual(repairPositions, [5, 10]);
+    const firstFrame = (await readFile(join(framesDirectory, frameFiles[0]), 'utf8')).replace(/\r?\n$/, '');
+    assert.equal(firstFrame.startsWith('MQR1:'), true);
+    assert.equal(qrModulesForFragment(firstFrame, 'low', 21), 101);
 
     const decoded = runCli(['decode', framesDirectory, '--out', outputPath]);
     assert.equal(decoded.status, 0, decoded.stderr || decoded.stdout);
@@ -162,202 +67,34 @@ test('CLI keeps one global fountain session when exporting a grid', async () => 
   }
 });
 
-test('CLI exports QR frames as row-major grid PNG pages', async () => {
-  const directory = await mkdtemp(join(tmpdir(), 'murfile-grid-'));
+test('CLI respects custom grid, QR version, and error correction', async () => {
+  const directory = await mkdtemp(join(tmpdir(), 'murfile-profile-'));
   try {
     const sourcePath = join(directory, 'sample.bin');
     const framesDirectory = join(directory, 'frames');
-    const outputPath = join(directory, 'recovered.bin');
-    const original = randomBytes(4000);
-    const targetVersion = 15;
-    const size = 128;
-    const columns = 2;
-    const rows = 2;
-    const gap = 7;
-    const padding = 13;
-    await writeFile(sourcePath, original);
+    await writeFile(sourcePath, randomBytes(400));
 
     const encoded = runCli([
       'encode', sourcePath,
       '--out', framesDirectory,
-      '--qr-version', String(targetVersion),
-      '--max-fragment-length', '100',
-      '--size', String(size),
-      '--grid', `${columns}x${rows}`,
-      '--fountain-scope', 'page',
-      '--grid-gap', String(gap),
-      '--grid-padding', String(padding),
-      '--format', 'both',
-    ]);
-    assert.equal(encoded.status, 0, encoded.stderr || encoded.stdout);
-
-    const manifest = JSON.parse(await readFile(join(framesDirectory, 'manifest.json'), 'utf8'));
-    assert.equal(manifest.fountainScope, 'page');
-    assert.equal(manifest.grid.fountainScope, 'page');
-    assert.equal(manifest.grid.columns, columns);
-    assert.equal(manifest.grid.rows, rows);
-    assert.equal(manifest.grid.gap, gap);
-    assert.equal(manifest.grid.padding, padding);
-    assert.equal(manifest.grid.framesPerPage, columns * rows);
-    assert.equal(manifest.grid.pageCount, Math.ceil(manifest.frameCount / (columns * rows)));
-    assert.equal(manifest.grid.dataFramesPerPage, 3);
-    assert.equal(manifest.grid.repairFramesPerPage, 1);
-    assert.equal(manifest.grid.pageCode, 'vandermonde-gf256-v1');
-    assert.equal(manifest.grid.guaranteedErasures, 1);
-    assert.equal(manifest.urType, 'murpage');
-    assert.equal(manifest.grid.ordering, 'row-major');
-    assert.equal(manifest.qr.version, targetVersion);
-
-    const files = await readdir(framesDirectory);
-    const pageFiles = files.filter((file) => /^page-\d+\.png$/.test(file)).sort();
-    const urFiles = files.filter((file) => /^page-\d+-frame-\d+\.ur\.txt$/.test(file));
-    const individualPngFiles = files.filter((file) => /^frame-\d+\.png$/.test(file));
-    assert.equal(pageFiles.length, manifest.grid.pageCount);
-    assert.equal(urFiles.length, manifest.frameCount);
-    assert.equal(individualPngFiles.length, 0);
-
-    const expectedWidth = columns * size + (columns - 1) * gap + 2 * padding;
-    const expectedHeight = rows * size + (rows - 1) * gap + 2 * padding;
-    for (const pageFile of pageFiles) {
-      const png = await readFile(join(framesDirectory, pageFile));
-      assert.deepEqual(Array.from(png.subarray(0, 8)), [137, 80, 78, 71, 13, 10, 26, 10]);
-      assert.equal(png.readUInt32BE(16), expectedWidth);
-      assert.equal(png.readUInt32BE(20), expectedHeight);
-    }
-
-    const decoded = runCli(['decode', framesDirectory, '--out', outputPath]);
-    assert.equal(decoded.status, 0, decoded.stderr || decoded.stdout);
-    assert.equal(hash(await readFile(outputPath)), hash(original));
-  } finally {
-    await rm(directory, { recursive: true, force: true });
-  }
-});
-
-test('CLI exports both global and page-scoped fountain transfers', async () => {
-  const directory = await mkdtemp(join(tmpdir(), 'murfile-both-scopes-'));
-  try {
-    const sourcePath = join(directory, 'sample.bin');
-    const framesDirectory = join(directory, 'frames');
-    const globalOutputPath = join(directory, 'recovered-global.bin');
-    const pageOutputPath = join(directory, 'recovered-page.bin');
-    const original = randomBytes(4000);
-    await writeFile(sourcePath, original);
-
-    const encoded = runCli([
-      'encode', sourcePath,
-      '--out', framesDirectory,
-      '--max-fragment-length', '100',
-      '--size', '128',
       '--grid', '2x2',
-      '--fountain-scope', 'both',
-      '--format', 'both',
+      '--qr-version', '15',
+      '--correction', 'medium',
+      '--repair-symbols', '1',
     ]);
     assert.equal(encoded.status, 0, encoded.stderr || encoded.stdout);
 
     const manifest = JSON.parse(await readFile(join(framesDirectory, 'manifest.json'), 'utf8'));
-    assert.equal(manifest.format, 'MUR-BOTH');
-    assert.equal(manifest.fountainScope, 'both');
-    assert.equal(manifest.transfers.global.directory, 'global');
-    assert.equal(manifest.transfers.page.directory, 'page');
-
-    const globalDirectory = join(framesDirectory, 'global');
-    const pageDirectory = join(framesDirectory, 'page');
-    const globalManifest = JSON.parse(await readFile(join(globalDirectory, 'manifest.json'), 'utf8'));
-    const pageManifest = JSON.parse(await readFile(join(pageDirectory, 'manifest.json'), 'utf8'));
-    assert.equal(globalManifest.fountainScope, 'global');
-    assert.equal(pageManifest.fountainScope, 'page');
-
-    const globalDecoded = runCli(['decode', globalDirectory, '--out', globalOutputPath]);
-    assert.equal(globalDecoded.status, 0, globalDecoded.stderr || globalDecoded.stdout);
-    assert.equal(hash(await readFile(globalOutputPath)), hash(original));
-
-    const pageDecoded = runCli(['decode', pageDirectory, '--out', pageOutputPath]);
-    assert.equal(pageDecoded.status, 0, pageDecoded.stderr || pageDecoded.stdout);
-    assert.equal(hash(await readFile(pageOutputPath)), hash(original));
+    assert.deepEqual(
+      [manifest.qr.version, manifest.qr.correction, manifest.grid.columns, manifest.grid.rows],
+      [15, 'medium', 2, 2],
+    );
+    assert.equal(manifest.grid.sourceSymbols, 3);
+    assert.equal(manifest.grid.repairSymbols, 1);
+    const frameFile = (await readdir(framesDirectory)).find((file) => /\.mqr\.txt$/.test(file));
+    const frame = (await readFile(join(framesDirectory, frameFile), 'utf8')).replace(/\r?\n$/, '');
+    assert.equal(qrModulesForFragment(frame, 'medium', 15), 77);
   } finally {
     await rm(directory, { recursive: true, force: true });
   }
-});
-
-test('CLI page redundancy profile low reserves one quarter of grid cells for repair', async () => {
-  const directory = await mkdtemp(join(tmpdir(), 'murfile-low-redundancy-'));
-  try {
-    const sourcePath = join(directory, 'sample.bin');
-    const framesDirectory = join(directory, 'frames');
-    await writeFile(sourcePath, randomBytes(1200));
-
-    const encoded = runCli([
-      'encode', sourcePath,
-      '--out', framesDirectory,
-      '--grid', '4x4',
-      '--fountain-scope', 'page',
-      '--page-redundancy', 'low',
-      '--qr-version', '20',
-      '--size', '128',
-      '--format', 'png',
-    ]);
-    assert.equal(encoded.status, 0, encoded.stderr || encoded.stdout);
-
-    const manifest = JSON.parse(await readFile(join(framesDirectory, 'manifest.json'), 'utf8'));
-    assert.equal(manifest.pageRedundancy, 'low');
-    assert.equal(manifest.grid.repairFramesPerPage, 4);
-    assert.equal(manifest.grid.dataFramesPerPage, 12);
-  } finally {
-    await rm(directory, { recursive: true, force: true });
-  }
-});
-
-test('CLI requires a grid when both fountain scopes are selected', () => {
-  const encoded = runCli([
-    'encode', 'unused.bin',
-    '--out', '/tmp/murfile-both-scope-without-grid',
-    '--fountain-scope', 'both',
-  ]);
-  assert.notEqual(encoded.status, 0);
-  assert.match(encoded.stderr, /--fountain-scope both requires --grid/);
-});
-
-test('CLI requires a grid when page fountain scope is selected', () => {
-  const encoded = runCli([
-    'encode', 'unused.bin',
-    '--out', '/tmp/murfile-page-scope-without-grid',
-    '--fountain-scope', 'page',
-  ]);
-  assert.notEqual(encoded.status, 0);
-  assert.match(encoded.stderr, /--fountain-scope page requires --grid/);
-});
-
-
-test('CLI inspect emits JSON status', async () => {
-  const directory = await mkdtemp(join(tmpdir(), 'murfile-inspect-'));
-  try {
-    const inputPath = join(directory, 'sample.bin');
-    const framesDirectory = join(directory, 'frames');
-    await writeFile(inputPath, randomBytes(600));
-    const encoded = runCli([
-      'encode', inputPath,
-      '--out', framesDirectory,
-      '--frames', '12',
-      '--max-fragment-length', '100',
-      '--format', 'ur',
-    ]);
-    assert.equal(encoded.status, 0, encoded.stderr || encoded.stdout);
-
-    const inspected = runCli(['inspect', framesDirectory, '--json']);
-    assert.equal(inspected.status, 0, inspected.stderr || inspected.stdout);
-    const report = JSON.parse(inspected.stdout);
-    assert.equal(report.urStringsRead, 12);
-    assert.equal(report.mode, 'multipart');
-  } finally {
-    await rm(directory, { recursive: true, force: true });
-  }
-});
-
-
-test('Blockchain Commons QR renderer creates a PNG for an emitted MUR fragment', () => {
-  const encoder = new FileEncoder(randomBytes(2048), { maxFragmentLength: 100 });
-  const fragment = encoder.nextFragment();
-  const png = renderUrQr(fragment, { size: 256, correction: 'medium' }).toPng();
-  assert.ok(png instanceof Uint8Array);
-  assert.deepEqual(Array.from(png.subarray(0, 8)), [137, 80, 78, 71, 13, 10, 26, 10]);
 });

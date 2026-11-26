@@ -1,42 +1,13 @@
-import { extractCbor } from '@blockchaincommons/dcbor';
-import { UR } from '@blockchaincommons/uniform-resources';
-import { decodeBytewords } from '@blockchaincommons/uniform-resources/bytewords';
-import { decodeFountainPart } from '@blockchaincommons/uniform-resources/fountain';
+import { FileDecoder, isMqrCandidate } from './decoder.js';
+import { mqrTransferId } from './mqr-protocol.js';
 import { parseSoundbookPageEnvelope } from './soundbook-transfer.js';
-import { PageMultipartDecoder } from './page-fountain.js';
-
-const MULTIPART_CANDIDATE = /^ur:[^/]+\/\+?[0-9]+-\+?[0-9]+\//;
-
-function sessionKeyForUr(value) {
-  const separator = value.lastIndexOf('/');
-  if (separator === -1 || separator === value.length - 1) {
-    throw new TypeError('Malformed multipart UR bytewords payload.');
-  }
-  const partBytes = decodeBytewords(value.slice(separator + 1), 'minimal');
-  const part = decodeFountainPart(partBytes);
-  const type = value.slice(3, value.indexOf('/')).toLowerCase();
-  return `${type}:${part.seqLen}:${part.messageLen}:${part.checksum}:${part.data.byteLength}`;
-}
-
-function bytesFromUr(ur) {
-  if (!ur.isType('bytes')) {
-    throw new TypeError(`Unsupported UR type "${ur.type.name}"; expected "bytes".`);
-  }
-  const value = extractCbor(ur.cbor);
-  if (!(value instanceof Uint8Array)) {
-    throw new TypeError('The CBOR payload of ur:bytes is not a CBOR byte string.');
-  }
-  return new Uint8Array(value);
-}
 
 function sameBookMetadata(a, b) {
   return a.bookId === b.bookId &&
     a.format === b.format &&
     a.pageCount === b.pageCount &&
     a.audioLength === b.audioLength &&
-    (a.format === 'SOUNDBOOK-1' || a.format === 'SOUNDBOOK-3'
-      ? a.chunkCapacity === b.chunkCapacity
-      : a.segmentCapacity === b.segmentCapacity) &&
+    a.chunkCapacity === b.chunkCapacity &&
     a.durationMicros === b.durationMicros &&
     a.codec === b.codec &&
     a.audioSha256 === b.audioSha256;
@@ -54,11 +25,11 @@ async function sha256Hex(bytes) {
   return Array.from(new Uint8Array(digest), (byte) => byte.toString(16).padStart(2, '0')).join('');
 }
 
-/** Reconstructs one Soundbook audio book from independent page-coded sessions. */
+/** Reconstructs an Ogg Opus book from independent RaptorQ-coded MQR1 pages. */
 export class SoundbookDecoder {
   #sessions = new Map();
-  #completedSessions = new Set();
-  #seen = new Set();
+  #completedTransfers = new Set();
+  #seenFrames = new Set();
   #pages = new Map();
   #bookMetadata;
   #audioBytes;
@@ -68,16 +39,17 @@ export class SoundbookDecoder {
   }
 
   reset() {
-    this.#sessions = new Map();
-    this.#completedSessions = new Set();
-    this.#seen = new Set();
-    this.#pages = new Map();
+    for (const session of this.#sessions.values()) session.decoder.reset();
+    this.#sessions.clear();
+    this.#completedTransfers.clear();
+    this.#seenFrames.clear();
+    this.#pages.clear();
     this.#bookMetadata = undefined;
     this.#audioBytes = undefined;
     this.fragmentsReceived = 0;
     this.duplicatesIgnored = 0;
     this.redundantFragments = 0;
-    this.invalidUris = 0;
+    this.invalidFrames = 0;
   }
 
   get complete() {
@@ -96,6 +68,11 @@ export class SoundbookDecoder {
       : [];
     let contiguousPageCount = 0;
     while (this.#pages.has(contiguousPageCount)) contiguousPageCount += 1;
+    const activeSessions = [...this.#sessions.entries()].map(([key, session]) => ({
+      key,
+      progress: session.decoder.progress,
+      fragmentsReceived: session.decoder.status.fragmentsReceived,
+    }));
     return {
       format: metadata?.format ?? null,
       bookId: metadata?.bookId ?? null,
@@ -104,31 +81,23 @@ export class SoundbookDecoder {
       contiguousPageCount,
       missingPages,
       availablePages: [...this.#pages.keys()].sort((a, b) => a - b),
-      activeSessions: [...this.#sessions.entries()].map(([key, session]) => ({
-        key,
-        progress: session.decoder.progress,
-        fragmentsReceived: session.fragmentsReceived,
-      })),
+      activeSessions,
       fragmentsReceived: this.fragmentsReceived,
       duplicatesIgnored: this.duplicatesIgnored,
       redundantFragments: this.redundantFragments,
-      invalidUris: this.invalidUris,
-      audioAvailable: metadata?.format === 'SOUNDBOOK-2' || metadata?.format === 'SOUNDBOOK-3'
-        ? this.#pages.size > 0
-        : this.complete,
+      invalidFrames: this.invalidFrames,
+      audioAvailable: (metadata?.format === 'SOUNDBOOK-3' || metadata?.format === 'SOUNDBOOK-4') &&
+        this.#pages.size > 0,
       audioDurationMicros: metadata?.durationMicros ?? null,
       audioBytes: this.complete ? this.#audioBytes.byteLength : null,
       complete: this.complete,
     };
   }
 
-  async #acceptPage(page) {
-    if (page.format === 'SOUNDBOOK-2') return this.#acceptSegment(page);
-    if (page.format === 'SOUNDBOOK-3') return this.#acceptChunk(page);
-    return this.#acceptLegacyPage(page);
-  }
-
   async #acceptChunk(page) {
+    if (page.format !== 'SOUNDBOOK-3' && page.format !== 'SOUNDBOOK-4') {
+      throw new Error('MQR frame payload is not a supported Soundbook byte chunk.');
+    }
     if (!this.#bookMetadata) {
       this.#bookMetadata = {
         format: page.format,
@@ -198,183 +167,52 @@ export class SoundbookDecoder {
     };
   }
 
-  async #acceptSegment(page) {
-    if (!this.#bookMetadata) {
-      this.#bookMetadata = {
-        format: page.format,
-        bookId: page.bookId,
-        pageCount: page.pageCount,
-        audioLength: page.audioLength,
-        segmentCapacity: page.segmentCapacity,
-        durationMicros: page.durationMicros,
-        codec: page.codec,
-        audioSha256: page.audioSha256,
-      };
-    } else if (!sameBookMetadata(this.#bookMetadata, page)) {
-      throw new Error('Page belongs to a different or inconsistent Soundbook.');
-    }
-
-    const existing = this.#pages.get(page.pageIndex);
-    if (existing) {
-      if (!sameBytes(existing, page.segmentBytes)) {
-        throw new Error(`Conflicting data received for Soundbook page ${page.pageIndex + 1}.`);
-      }
-      this.duplicatesIgnored += 1;
-      return { kind: 'duplicate-page', pageIndex: page.pageIndex, status: this.status };
-    }
-
-    if (await sha256Hex(page.segmentBytes) !== page.segmentSha256) {
-      throw new Error(`Soundbook page ${page.pageIndex + 1} segment SHA-256 integrity check failed.`);
-    }
-
-    if (this.#pages.size + 1 === page.pageCount) {
-      const segments = Array.from({ length: page.pageCount }, (_, index) =>
-        index === page.pageIndex ? page.segmentBytes : this.#pages.get(index));
-      if (segments.some((segment) => !segment) ||
-          segments.reduce((total, segment) => total + segment.byteLength, 0) !== page.audioLength) {
-        throw new Error('Soundbook segments do not match the declared book length.');
-      }
-      const audio = new Uint8Array(page.audioLength);
-      let offset = 0;
-      for (const segment of segments) {
-        audio.set(segment, offset);
-        offset += segment.byteLength;
-      }
-      if (await sha256Hex(audio) !== page.audioSha256) {
-        throw new Error('Soundbook audio SHA-256 integrity check failed; reset and scan the pages again.');
-      }
-      this.#pages.set(page.pageIndex, page.segmentBytes);
-      this.#audioBytes = audio;
-      return {
-        kind: 'book-complete',
-        audioBytes: this.result,
-        segmentBytes: page.segmentBytes.slice(),
-        playbackPageIndex: page.pageIndex,
-        playbackPageCount: page.pageCount,
-        pageIndex: page.pageIndex,
-        status: this.status,
-      };
-    }
-
-    this.#pages.set(page.pageIndex, page.segmentBytes);
-    return {
-      kind: 'page-complete',
-      pageIndex: page.pageIndex,
-      pageCount: page.pageCount,
-      segmentBytes: page.segmentBytes.slice(),
-      playbackPageIndex: page.pageIndex,
-      playbackPageCount: page.pageCount,
-      status: this.status,
-    };
-  }
-
-  async #acceptLegacyPage(page) {
-    if (!this.#bookMetadata) {
-      this.#bookMetadata = {
-        format: page.format,
-        bookId: page.bookId,
-        pageCount: page.pageCount,
-        audioLength: page.audioLength,
-        chunkCapacity: page.chunkCapacity,
-        durationMicros: page.durationMicros,
-        codec: page.codec,
-        audioSha256: page.audioSha256,
-      };
-    } else if (!sameBookMetadata(this.#bookMetadata, page)) {
-      throw new Error('Page belongs to a different or inconsistent Soundbook.');
-    }
-
-    const existing = this.#pages.get(page.pageIndex);
-    if (existing) {
-      if (!sameBytes(existing, page.chunk)) {
-        throw new Error(`Conflicting data received for Soundbook page ${page.pageIndex + 1}.`);
-      }
-      this.duplicatesIgnored += 1;
-      return { kind: 'duplicate-page', pageIndex: page.pageIndex, status: this.status };
-    }
-
-    if (this.#pages.size + 1 === page.pageCount) {
-      const audio = new Uint8Array(page.audioLength);
-      for (let index = 0; index < page.pageCount; index += 1) {
-        const chunk = index === page.pageIndex ? page.chunk : this.#pages.get(index);
-        if (!chunk) throw new Error(`Soundbook page ${index + 1} is missing.`);
-        audio.set(chunk, index * page.chunkCapacity);
-      }
-      if (await sha256Hex(audio) !== page.audioSha256) {
-        throw new Error('Soundbook audio SHA-256 integrity check failed; reset and scan the pages again.');
-      }
-      this.#pages.set(page.pageIndex, page.chunk);
-      this.#audioBytes = audio;
-      return {
-        kind: 'book-complete',
-        audioBytes: this.result,
-        segmentBytes: this.result,
-        playbackPageIndex: 0,
-        playbackPageCount: 1,
-        pageIndex: page.pageIndex,
-        status: this.status,
-      };
-    }
-
-    this.#pages.set(page.pageIndex, page.chunk);
-    return {
-      kind: 'page-complete',
-      pageIndex: page.pageIndex,
-      pageCount: page.pageCount,
-      status: this.status,
-    };
-  }
-
   async add(fragment) {
-    const normalized = String(fragment ?? '').trim().toLowerCase();
-    if (!MULTIPART_CANDIDATE.test(normalized)) {
-      this.invalidUris += 1;
-      return {
-        kind: 'invalid',
-        message: 'Soundbook requires a multipart UR page fragment.',
-        status: this.status,
-      };
+    const text = String(fragment ?? '').replace(/\r?\n$/, '');
+    if (!isMqrCandidate(text)) {
+      this.invalidFrames += 1;
+      return { kind: 'invalid', message: 'Soundbook requires an MQR1 frame.', status: this.status };
     }
     if (this.complete) return { kind: 'book-complete', audioBytes: this.result, status: this.status };
-    if (this.#seen.has(normalized)) {
-      this.duplicatesIgnored += 1;
-      return { kind: 'duplicate', status: this.status };
-    }
 
     try {
-      const sessionKey = sessionKeyForUr(normalized);
-      this.#seen.add(normalized);
-      if (this.#completedSessions.has(sessionKey)) {
+      const transferId = mqrTransferId(text);
+      if (this.#seenFrames.has(text)) {
         this.duplicatesIgnored += 1;
+        return { kind: 'duplicate', status: this.status };
+      }
+      this.#seenFrames.add(text);
+      if (this.#completedTransfers.has(transferId)) {
+        this.redundantFragments += 1;
         return { kind: 'redundant', status: this.status };
       }
 
-      let session = this.#sessions.get(sessionKey);
+      let session = this.#sessions.get(transferId);
       if (!session) {
-        session = { decoder: new PageMultipartDecoder(), fragmentsReceived: 0 };
-        this.#sessions.set(sessionKey, session);
+        session = { decoder: new FileDecoder() };
+        this.#sessions.set(transferId, session);
       }
-      const addedInformation = session.decoder.add(normalized);
-      session.fragmentsReceived += 1;
+      const result = session.decoder.add(text);
+      if (result.kind === 'invalid') {
+        this.invalidFrames += 1;
+        return { kind: 'invalid', message: result.message, status: this.status };
+      }
+      if (result.kind === 'duplicate' || result.kind === 'redundant') {
+        this.redundantFragments += 1;
+        return { kind: 'redundant', status: this.status };
+      }
       this.fragmentsReceived += 1;
-      if (!addedInformation) this.redundantFragments += 1;
+      if (!session.decoder.complete) return { kind: 'fragment', status: this.status };
 
-      if (!session.decoder.done) {
-        return {
-          kind: addedInformation ? 'fragment' : 'redundant',
-          status: this.status,
-        };
-      }
-
-      const ur = session.decoder.result;
-      if (!ur) throw new Error('MUR decoder completed without returning a UR.');
-      const page = parseSoundbookPageEnvelope(bytesFromUr(ur));
-      if (!page) throw new Error('Completed MUR session is not a Soundbook page.');
-      this.#sessions.delete(sessionKey);
-      this.#completedSessions.add(sessionKey);
-      return await this.#acceptPage(page);
+      const payload = session.decoder.result;
+      session.decoder.reset();
+      this.#sessions.delete(transferId);
+      this.#completedTransfers.add(transferId);
+      const page = parseSoundbookPageEnvelope(payload);
+      if (!page) throw new Error('Completed MQR block is not a Soundbook byte chunk.');
+      return await this.#acceptChunk(page);
     } catch (error) {
-      this.invalidUris += 1;
+      this.invalidFrames += 1;
       return {
         kind: 'invalid',
         message: error instanceof Error ? error.message : String(error),

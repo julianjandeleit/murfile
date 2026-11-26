@@ -1,6 +1,7 @@
 const MAGIC_V1 = new Uint8Array([0x53, 0x4e, 0x44, 0x42, 0x4f, 0x4f, 0x4b, 0x31]);
 const MAGIC_V2 = new Uint8Array([0x53, 0x4e, 0x44, 0x42, 0x4f, 0x4f, 0x4b, 0x32]);
 const MAGIC_V3 = new Uint8Array([0x53, 0x4e, 0x44, 0x42, 0x4f, 0x4f, 0x4b, 0x33]);
+const MAGIC_V4 = new Uint8Array([0x53, 0x4e, 0x44, 0x42, 0x4f, 0x4f, 0x4b, 0x34]);
 export const SOUNDBOOK_HEADER_LENGTH = 89;
 export const SOUNDBOOK_SEGMENT_HEADER_LENGTH = 121;
 export const SOUNDBOOK_CHUNK_HEADER_LENGTH = 121;
@@ -154,7 +155,7 @@ export function createSoundbookChunkEnvelope({
   const chunkHash = hexToBytes(chunkSha256, 32, 'chunkSha256');
   const audioHash = hexToBytes(audioSha256, 32, 'audioSha256');
   const output = new Uint8Array(SOUNDBOOK_CHUNK_HEADER_LENGTH + chunkCapacity);
-  output.set(MAGIC_V3, 0);
+  output.set(MAGIC_V4, 0);
   output.set(id, 8);
   const view = new DataView(output.buffer);
   view.setUint32(24, pageIndex, false);
@@ -276,7 +277,7 @@ function parseSoundbookV2(bytes) {
   };
 }
 
-function parseSoundbookV3(bytes) {
+function parseSoundbookV3(bytes, format = 'SOUNDBOOK-3') {
   if (bytes.byteLength < SOUNDBOOK_CHUNK_HEADER_LENGTH) {
     throw new Error('Truncated Soundbook byte-chunk envelope.');
   }
@@ -313,7 +314,7 @@ function parseSoundbookV3(bytes) {
     if (paddedChunk[index] !== 0) throw new Error('Soundbook chunk padding is not zero-filled.');
   }
   return {
-    format: 'SOUNDBOOK-3',
+    format,
     bookId: bytesToHex(bytes.subarray(8, 24)),
     pageIndex,
     pageCount,
@@ -328,9 +329,10 @@ function parseSoundbookV3(bytes) {
   };
 }
 
-/** Parse and validate a Soundbook page envelope, or return undefined for other UR payloads. */
+/** Parse and validate a Soundbook page envelope, or return undefined for other payloads. */
 export function parseSoundbookPageEnvelope(bytes) {
   if (!(bytes instanceof Uint8Array)) return undefined;
+  if (hasMagic(bytes, MAGIC_V4)) return parseSoundbookV3(bytes, 'SOUNDBOOK-4');
   if (hasMagic(bytes, MAGIC_V3)) return parseSoundbookV3(bytes);
   if (hasMagic(bytes, MAGIC_V1)) return parseSoundbookV1(bytes);
   if (hasMagic(bytes, MAGIC_V2)) return parseSoundbookV2(bytes);

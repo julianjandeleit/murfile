@@ -4,16 +4,16 @@
     <meta charset="UTF-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
     <meta name="theme-color" content="#101216" />
-    <meta name="description" content="Lokaler Live-Reader für Blockchain Commons Multipart UR." />
-    <title>MUR File Reader</title>
+    <meta name="description" content="Lokaler Live-Reader für RaptorQ-basierte MQR1-QR-Übertragungen." />
+    <title>Murfile Reader</title>
   </head>
   <body>
     <div id="app">
       <header class="topbar">
         <div class="brand-mark" aria-hidden="true">M</div>
         <div>
-          <div class="eyebrow">BLOCKCHAIN COMMONS · MUR</div>
-          <h1>MUR File Reader</h1>
+          <div class="eyebrow">MQR1 · DATEIÜBERTRAGUNG</div>
+          <h1>Murfile Reader</h1>
         </div>
         <nav class="app-switcher" aria-label="Decoder wechseln">
           <a href="../murfile/" aria-current="page">Murfile</a>
@@ -34,7 +34,7 @@
             <div class="video-placeholder" id="videoPlaceholder">
               <div class="camera-glyph">⌗</div>
               <strong>Kamera noch nicht gestartet</strong>
-              <span>Erlaube den Kamerazugriff, um MUR-QR-Codes einzulesen.</span>
+              <span>Erlaube den Kamerazugriff, um MQR1-QR-Codes einzulesen.</span>
             </div>
             <div class="video-overlay" aria-hidden="true">
               <div class="corner top-left"></div><div class="corner top-right"></div>
@@ -64,7 +64,7 @@
             </div>
             <div class="transfer-status">
               <div id="transferIcon" class="transfer-icon">↯</div>
-              <div class="transfer-copy"><strong id="transferTitle">Warte auf UR-Fragmente</strong><span id="transferSubtitle">Richte die Kamera auf einen MUR-QR-Code.</span></div>
+              <div class="transfer-copy"><strong id="transferTitle">Warte auf MQR1-Frames</strong><span id="transferSubtitle">Richte die Kamera auf einen MQR1-QR-Code.</span></div>
             </div>
             <div class="progress-row"><progress id="decodeProgress" max="1" value="0"></progress><span id="progressLabel">0 %</span></div>
           <div id="pageProgressLabel" class="page-progress-label" hidden></div>
@@ -72,7 +72,7 @@
               <div class="metric"><span>Einzigartige Fragmente</span><strong id="fragmentCount">0</strong></div>
               <div class="metric"><span>Duplikate</span><strong id="duplicateCount">0</strong></div>
               <div class="metric"><span>QR-Codes erkannt</span><strong id="qrCount">0</strong></div>
-              <div class="metric"><span>Ungültige URs</span><strong id="invalidCount">0</strong></div>
+              <div class="metric"><span>Ungültige Frames</span><strong id="invalidCount">0</strong></div>
             </div>
             <div class="event-list-wrap">
               <div class="subheading"><span>Letzte Ereignisse</span><span id="eventCount">0</span></div>
@@ -82,11 +82,11 @@
 
           <section class="panel result-panel">
             <div class="panel-heading"><div><div class="eyebrow">REKONSTRUKTION</div><h2>Ergebnis</h2></div><div id="resultBadge" class="result-badge">Ausstehend</div></div>
-            <div id="resultEmpty" class="result-empty"><div class="file-glyph">⇩</div><strong>Noch keine Datei</strong><span>Nach vollständiger MUR-Rekonstruktion erscheint hier der Download.</span></div>
+            <div id="resultEmpty" class="result-empty"><div class="file-glyph">⇩</div><strong>Noch keine Datei</strong><span>Nach vollständiger MQR1-Rekonstruktion erscheint hier der Download.</span></div>
             <div id="resultContent" class="result-content" hidden>
               <label class="filename-label" for="filenameInput">Dateiname</label>
               <input id="filenameInput" type="text" value="recovered.bin" spellcheck="false" />
-              <div class="file-meta"><div><span>Größe</span><strong id="fileSize">–</strong></div><div><span>UR-Typ</span><strong>bytes</strong></div></div>
+              <div class="file-meta"><div><span>Größe</span><strong id="fileSize">–</strong></div><div><span>Format</span><strong>MQR1</strong></div></div>
               <div class="hash-row"><span>SHA-256</span><code id="hashValue">Wird berechnet …</code></div>
               <button id="downloadButton" class="button button-download" type="button" disabled>Datei herunterladen <span>↓</span></button>
             </div>
@@ -95,7 +95,7 @@
           <div class="local-note"><span>🔒</span><span>Videobild, QR-Daten und rekonstruierte Datei bleiben auf diesem Gerät. Es werden keine Daten an einen Server übertragen.</span></div>
         </aside>
       </main>
-      <footer><span>MUR File Reader · Prototyp</span><span>UR/MUR: Blockchain Commons · QR: ZBar / WebAssembly</span></footer>
+      <footer><span>Murfile Reader · MQR1</span><span>RaptorQ · Base45 · QR: ZBar / WebAssembly</span></footer>
     </div>
     <script type="module" src="/src/main.js"></script>
   </body>

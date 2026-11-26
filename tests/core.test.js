@@ -1,191 +1,79 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { randomBytes, createHash } from 'node:crypto';
-import { UR } from '@blockchaincommons/uniform-resources';
-import { FileDecoder, FileEncoder, createBytesUr, isMultipartUrCandidate } from '../src/index.js';
-import { createPageEnvelope } from '../src/page-transfer.js';
-import { encodePageFragments } from '../src/page-fountain.js';
+import { randomBytes } from 'node:crypto';
+import { FileDecoder, FileEncoder, decodeBase45, encodeBase45, parseMqrFrame } from '../src/index.js';
 
 function equalBytes(actual, expected) {
   assert.deepEqual(Buffer.from(actual), Buffer.from(expected));
 }
 
-test('FileEncoder emits a single-part UR when the CBOR payload fits one fragment', () => {
-  const encoder = new FileEncoder(new Uint8Array([1, 2, 3]), { maxFragmentLength: 100 });
-  assert.equal(encoder.isSinglePart, true);
-  const fragment = encoder.nextFragment();
-  assert.match(fragment, /^ur:bytes\//);
-  assert.equal(encoder.nextFragment(), undefined);
-});
-
-test('createBytesUr creates a standard ur:bytes single-part resource', () => {
-  const original = new Uint8Array([0, 1, 2, 127, 128, 254, 255]);
-  const ur = createBytesUr(original);
-  assert.equal(ur.type.name, 'bytes');
-  assert.match(ur.toString(), /^ur:bytes\//);
-
-  const decoder = new FileDecoder();
-  const result = decoder.add(ur.toString());
-  assert.equal(result.kind, 'complete');
-  equalBytes(result.bytes, original);
-});
-
-test('FileEncoder emits MUR strings accepted by the official decoder wrapper', () => {
-  const original = randomBytes(4096);
-  const encoder = new FileEncoder(original, { maxFragmentLength: 80 });
-  const fragment = encoder.nextFragment();
-
-  assert.equal(typeof fragment, 'string');
-  assert.match(fragment, /^ur:bytes\/\+?\d+-\+?\d+\//);
-  assert.equal(encoder.emittedCount, 1);
-  assert.ok(encoder.sourcePartCount > 1);
-});
-
-test('FileDecoder reconstructs a multipart file from the systematic fragments', () => {
-  const original = randomBytes(8192);
-  const encoder = new FileEncoder(original, { maxFragmentLength: 90 });
-  const fragments = encoder.take(encoder.sourcePartCount);
-  const decoder = new FileDecoder();
-
-  for (const fragment of fragments) {
-    decoder.add(fragment);
-    if (decoder.complete) break;
-  }
-
-  assert.equal(decoder.complete, true);
-  equalBytes(decoder.result, original);
-  assert.equal(decoder.progress, 1);
-});
-
-test('FileDecoder accepts fragments in a different order', () => {
-  const original = randomBytes(3072);
-  const encoder = new FileEncoder(original, { maxFragmentLength: 64 });
-  const fragments = encoder.take(encoder.sourcePartCount);
-  // Deterministic nontrivial permutation: reverse is enough to test that
-  // sequence-number order is not required by the fountain decoder.
-  const decoder = new FileDecoder();
-  for (const fragment of fragments.reverse()) {
-    decoder.add(fragment);
-    if (decoder.complete) break;
-  }
-
-  assert.equal(decoder.complete, true);
-  equalBytes(decoder.result, original);
-});
-
-
-test('FileDecoder can recover a missing systematic fragment from repair fragments', () => {
-  const original = randomBytes(2048);
-  const encoder = new FileEncoder(original, { maxFragmentLength: 96 });
-  const sourceCount = encoder.sourcePartCount;
-  const fragments = encoder.take(sourceCount + 100);
-  const decoder = new FileDecoder();
-
-  // Omit one of the initial plain fragments, then continue with the fountain
-  // repair sequence. The fixed sequence seed makes this regression test repeatable.
-  for (let index = 0; index < fragments.length; index += 1) {
-    if (index === 1) continue;
-    decoder.add(fragments[index]);
-    if (decoder.complete) break;
-  }
-
-  assert.equal(decoder.complete, true, `decoder progress was ${(decoder.progress * 100).toFixed(2)} %`);
-  equalBytes(decoder.result, original);
-});
-
-test('FileDecoder ignores repeated QR detections', () => {
-  const original = randomBytes(1024);
-  const encoder = new FileEncoder(original, { maxFragmentLength: 100 });
-  const first = encoder.nextFragment();
-  const decoder = new FileDecoder();
-
-  assert.equal(decoder.add(first).kind, 'fragment');
-  assert.equal(decoder.add(first.toUpperCase()).kind, 'duplicate');
-  assert.equal(decoder.status.duplicatesIgnored, 1);
-});
-
-test('FileDecoder rejects non-bytes UR types', () => {
-  const other = UR.from('example', createBytesUr(new Uint8Array([1])).cbor).toString();
-  const decoder = new FileDecoder();
-  const result = decoder.add(other);
-  assert.equal(result.kind, 'invalid');
-  assert.match(result.message, /expected "bytes"/);
-  assert.equal(decoder.status.invalidUris, 1);
-});
-
-test('FileDecoder reports malformed UR strings without throwing', () => {
-  const decoder = new FileDecoder();
-  const result = decoder.add('ur:bytes/not-a-valid-bytewords-payload');
-  assert.equal(result.kind, 'invalid');
-  assert.equal(decoder.status.invalidUris, 1);
-});
-
-test('FileDecoder reconstructs independent page-scoped MUR sessions in interleaved order', () => {
-  const original = randomBytes(1800);
-  const fileHash = createHash('sha256').update(original).digest('hex');
-  const chunkCapacity = 900;
-  const pageFragments = [];
-
-  for (let pageIndex = 0; pageIndex < 2; pageIndex += 1) {
-    const chunk = original.slice(pageIndex * chunkCapacity, (pageIndex + 1) * chunkCapacity);
-    const envelope = createPageEnvelope({
-      pageIndex,
-      pageCount: 2,
-      originalSize: original.byteLength,
-      chunkLength: chunk.byteLength,
-      chunk,
-      fileSha256: fileHash,
-    });
-    const encoder = new FileEncoder(envelope, { maxFragmentLength: 128 });
-    pageFragments.push(encoder.take(encoder.sourcePartCount + 3));
-  }
-
-  const decoder = new FileDecoder();
-  const longest = Math.max(...pageFragments.map((fragments) => fragments.length));
-  for (let frameIndex = 0; frameIndex < longest && !decoder.complete; frameIndex += 1) {
-    for (const fragments of pageFragments) {
-      if (fragments[frameIndex]) decoder.add(fragments[frameIndex]);
-      if (decoder.complete) break;
-    }
-  }
-
-  assert.equal(decoder.complete, true);
-  equalBytes(decoder.result, original);
-  assert.equal(decoder.status.mode, 'pages');
-  assert.equal(decoder.status.completedPages, 2);
-  assert.equal(decoder.status.pageCount, 2);
-  assert.equal(decoder.status.expectedSha256, fileHash);
-});
-
-test('page-scoped MDS symbols recover any one missing cell in a 5x5 grid', () => {
-  const original = randomBytes(2800);
-  const fileHash = createHash('sha256').update(original).digest('hex');
-  const envelope = createPageEnvelope({
-    pageIndex: 0,
-    pageCount: 1,
-    originalSize: original.byteLength,
-    chunkLength: original.byteLength,
-    chunk: original,
-    fileSha256: fileHash,
+function makeEncoder(bytes, options = {}) {
+  return new FileEncoder(bytes, {
+    symbolSize: 64,
+    sourceSymbols: 13,
+    repairSymbols: 3,
+    transferId: '0123456789abcdef0123456789abcdef',
+    ...options,
   });
-  const { fragments, sourcePartCount } = encodePageFragments(envelope, 120, 25);
+}
 
-  assert.equal(sourcePartCount, 24);
-  assert.equal(fragments.length, 25);
-  assert.ok(fragments.every((fragment) => fragment.startsWith('ur:murpage/')));
+test('Base45 preserves binary data and spaces', () => {
+  const original = Uint8Array.from([0, 44, 255, 255, 0, 1, 128]);
+  const encoded = encodeBase45(original);
+  equalBytes(decodeBase45(encoded), original);
+  assert.equal(encodeBase45(Uint8Array.from([36])).includes(' '), true);
+});
 
-  for (let missingIndex = 0; missingIndex < fragments.length; missingIndex += 1) {
+test('MQR frame parsing validates the transport checksum', () => {
+  const frame = makeEncoder(randomBytes(128)).nextFragment();
+  const parsed = parseMqrFrame(frame);
+  assert.equal(parsed.transferId, '0123456789abcdef0123456789abcdef');
+  assert.equal(parsed.symbolSize, 64);
+
+  const last = frame.at(-1);
+  const corrupted = `${frame.slice(0, -1)}${last === '0' ? '1' : '0'}`;
+  assert.throws(() => parseMqrFrame(corrupted), /checksum|Base45/);
+});
+
+test('FileDecoder reconstructs a file with any one grid symbol missing', () => {
+  const original = randomBytes(700);
+  const frames = makeEncoder(original).nextPage();
+  assert.equal(frames.length, 16);
+
+  for (let missingIndex = 0; missingIndex < frames.length; missingIndex += 1) {
     const decoder = new FileDecoder();
-    for (let index = 0; index < fragments.length; index += 1) {
-      if (index !== missingIndex) decoder.add(fragments[index]);
+    for (let index = 0; index < frames.length; index += 1) {
+      if (index !== missingIndex) decoder.add(frames[index]);
     }
     assert.equal(decoder.complete, true, `failed when QR ${missingIndex + 1} was missing`);
     equalBytes(decoder.result, original);
   }
 });
 
-test('multipart candidate detection distinguishes single-part URs', () => {
-  assert.equal(isMultipartUrCandidate('UR:BYTES/1-12/ABC'), true);
-  assert.equal(isMultipartUrCandidate('ur:bytes/abc'), false);
-  assert.equal(isMultipartUrCandidate('not a ur'), false);
+test('FileDecoder reconstructs interleaved pages in any arrival order', () => {
+  const original = randomBytes(1600);
+  const encoder = makeEncoder(original);
+  const pages = Array.from({ length: encoder.pageCount }, () => encoder.nextPage());
+  assert.equal(pages.length, 2);
+
+  const decoder = new FileDecoder();
+  for (let index = 0; index < 16 && !decoder.complete; index += 1) {
+    for (const page of pages) {
+      decoder.add(page[index]);
+      if (decoder.complete) break;
+    }
+  }
+  assert.equal(decoder.complete, true);
+  equalBytes(decoder.result, original);
+  assert.deepEqual(decoder.status.missingPages, []);
+});
+
+test('FileDecoder counts duplicate and invalid MQR frames', () => {
+  const frame = makeEncoder(randomBytes(64)).nextFragment();
+  const decoder = new FileDecoder();
+  assert.equal(decoder.add(frame).kind, 'fragment');
+  assert.equal(decoder.add(frame).kind, 'duplicate');
+  assert.equal(decoder.add('MQR1:not a frame').kind, 'invalid');
+  assert.equal(decoder.status.duplicatesIgnored, 1);
+  assert.equal(decoder.status.invalidFrames, 1);
 });

@@ -7,14 +7,18 @@ function hash(bytes) {
   return createHash('sha256').update(bytes).digest('hex');
 }
 
-test('2.1 MB application-size roundtrip through the official MUR implementation', { timeout: 120_000 }, () => {
+test('2.1 MB application-size byte-exact MQR1 roundtrip', { timeout: 120_000 }, () => {
   const original = randomBytes(2_100_000);
-  const encoder = new FileEncoder(original, { maxFragmentLength: 500 });
+  const encoder = new FileEncoder(original, {
+    symbolSize: 512,
+    sourceSymbols: 13,
+    repairSymbols: 3,
+  });
   const decoder = new FileDecoder();
-  const hardLimit = encoder.sourcePartCount + 300;
 
-  for (let index = 0; index < hardLimit && !decoder.complete; index += 1) {
-    decoder.add(encoder.nextFragment());
+  for (const fragment of encoder) {
+    decoder.add(fragment);
+    if (decoder.complete) break;
   }
 
   assert.equal(decoder.complete, true, `decoder progress was ${(decoder.progress * 100).toFixed(2)} %`);
@@ -22,9 +26,13 @@ test('2.1 MB application-size roundtrip through the official MUR implementation'
   assert.deepEqual(Buffer.from(decoder.result), Buffer.from(original));
 });
 
-test('extra fountain fragments are tolerated after completion', () => {
+test('extra RaptorQ symbols are tolerated after completion', () => {
   const original = randomBytes(2048);
-  const encoder = new FileEncoder(original, { maxFragmentLength: 128 });
+  const encoder = new FileEncoder(original, {
+    symbolSize: 128,
+    sourceSymbols: 13,
+    repairSymbols: 3,
+  });
   const decoder = new FileDecoder();
 
   for (const fragment of encoder) {

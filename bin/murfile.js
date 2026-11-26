@@ -1,101 +1,71 @@
 #!/usr/bin/env node
-import { createHash } from 'node:crypto';
+import { sha256 } from '@noble/hashes/sha2.js';
 import { mkdir, readFile, readdir, rename, writeFile } from 'node:fs/promises';
 import { basename, join, resolve } from 'node:path';
-import { FileDecoder, FileEncoder } from '../src/index.js';
-import { createPageEnvelope, PAGE_ENVELOPE_HEADER_LENGTH } from '../src/page-transfer.js';
+import { FileDecoder, FileEncoder, MQR_PREFIX } from '../src/index.js';
 import {
-  chooseMaxFragmentLength,
+  chooseSymbolSize,
   composeGridPage,
   parseGrid,
   qrModulesForFragment,
   renderQrFragment,
 } from '../src/qr-grid.js';
-import { encodePageFragments } from '../src/page-fountain.js';
 
-const VERSION = '0.1.0';
+const VERSION = '0.2.0';
 
 function usage() {
   return `murfile ${VERSION}
 
-File-oriented encoder and decoder for Blockchain Commons UR/MUR.
+RaptorQ/Base45 multi-QR file encoder and decoder.
 
 Usage:
-  murfile encode <file> --out <directory> [--frames <count>] [options]
+  murfile encode <file> --out <directory> [options]
   murfile decode <file|directory|-> --out <file>
   murfile inspect <file|directory|-> [--json]
 
-Commands:
-  encode    Encode a file as UR fragments and QR PNG images.
-  decode    Reconstruct a file from .ur/.txt files or stdin.
-  inspect   Validate fragments and show fountain decoder progress.
-
 Encode options:
   --out <dir>                     Output directory (required)
-  --frames <count>                Number of MUR fragments (default: source count + 10% redundancy)
-  --max-fragment-length <bytes>   Maximum MUR fragment payload (default: largest QR-fitting size)
-  --qr-version <version>           Force QR matrix version 1-40 (default: automatic)
-  --grid <columns>x<rows>          Arrange QR codes on PNG pages, e.g. 3x3
-  --fountain-scope <scope>         global|page|both (default: global; page mode uses MDS-coded grid pages)
-  --page-redundancy <profile>       default|low (page-scoped erasure-recovery capacity)
-  --grid-gap <pixels>              Gap between QR codes (default: 24; requires --grid)
-  --grid-padding <pixels>          Outer grid margin (default: 48; requires --grid)
-  --size <pixels>                 QR image width/height (default: 512)
-  --correction <level>            low|medium|quartile|high (default: medium)
-  --format <format>               both|png|ur (default: both)
-  --force                         Allow writing into a non-empty output directory
+  --grid <columns>x<rows>          QR page layout (default: 4x4)
+  --qr-version <version>           QR version 1-40 (default: 21)
+  --correction <level>             low|medium|quartile|high (default: low)
+  --repair-symbols <count>          RaptorQ repair symbols per page (default: 2 on 4x4)
+  --grid-gap <pixels>               Gap between QR codes (default: 24)
+  --grid-padding <pixels>           Outer page margin (default: 48)
+  --size <pixels>                   QR image side length (default: 512)
+  --format <format>                 both|png|mqr (default: both)
+  --force                           Allow writing into a non-empty output directory
 
-Decode options:
-  --out <file>                    Reconstructed output path (required)
-
-Inspect options:
-  --json                          Emit machine-readable JSON
-
-Examples:
-  murfile encode ./song.mp3 --out ./song-qr --frames 150 --max-fragment-length 100
-  murfile decode ./song-qr --out ./recovered.mp3
-  murfile inspect ./song-qr
-  cat fragments.txt | murfile decode - --out ./recovered.bin
-
-The CLI reads UR strings, not QR image files. Use the included browser reader to
-scan printed pages or image files with a camera. Encode writes both .ur.txt and
-.png by default so that the same export can also be decoded by the CLI.
+Decode reads MQR1 text frames; it does not decode image files.
 `;
 }
 
 function parseArgs(argv) {
-  const [command, ...rest] = argv;
+  const [command, ...args] = argv;
   if (!command || command === '--help' || command === '-h' || command === 'help') {
     return { command: 'help' };
   }
   if (command === '--version' || command === '-v') return { command: 'version' };
-
   const positionals = [];
   const options = {};
   const valueOptions = new Set([
-    '--out', '-o', '--frames', '--max-fragment-length', '--qr-version', '--grid', '--fountain-scope', '--page-redundancy', '--grid-gap', '--grid-padding', '--size', '--correction', '--format',
+    '--out', '-o', '--grid', '--qr-version', '--correction', '--repair-symbols',
+    '--grid-gap', '--grid-padding', '--size', '--format',
   ]);
-  const aliases = { '-o': '--out' };
-
-  for (let index = 0; index < rest.length; index += 1) {
-    const argument = rest[index];
+  for (let index = 0; index < args.length; index += 1) {
+    const argument = args[index];
     if (argument === '-' || !argument.startsWith('-')) {
       positionals.push(argument);
       continue;
     }
-    const key = aliases[argument] || argument;
-    if (key === '--force' || key === '--json') {
-      options[key.slice(2)] = true;
+    if (argument === '--force' || argument === '--json') {
+      options[argument.slice(2)] = true;
       continue;
     }
-    if (!valueOptions.has(argument)) {
-      throw new Error(`Unknown option: ${argument}`);
-    }
-    const value = rest[index + 1];
-    if (value === undefined || value.startsWith('--')) {
-      throw new Error(`Missing value for ${argument}`);
-    }
-    options[key.slice(2).replaceAll('-', '_')] = value;
+    if (!valueOptions.has(argument)) throw new Error(`Unknown option: ${argument}`);
+    const value = args[index + 1];
+    if (value === undefined || value.startsWith('--')) throw new Error(`Missing value for ${argument}`);
+    const key = argument === '-o' ? 'out' : argument.slice(2).replaceAll('-', '_');
+    options[key] = value;
     index += 1;
   }
   return { command, positionals, options };
@@ -103,460 +73,118 @@ function parseArgs(argv) {
 
 function positiveInteger(value, label) {
   const number = Number(value);
-  if (!Number.isSafeInteger(number) || number < 1) {
-    throw new Error(`${label} must be a positive safe integer.`);
-  }
+  if (!Number.isSafeInteger(number) || number < 1) throw new Error(`${label} must be a positive safe integer.`);
   return number;
 }
 
 function nonNegativeInteger(value, label) {
   const number = Number(value);
-  if (!Number.isSafeInteger(number) || number < 0) {
-    throw new Error(`${label} must be a non-negative safe integer.`);
-  }
+  if (!Number.isSafeInteger(number) || number < 0) throw new Error(`${label} must be a non-negative safe integer.`);
   return number;
 }
 
-function pageRepairFrameCount(framesPerPage, profile) {
-  if (profile === 'low') return Math.max(1, Math.ceil(framesPerPage / 4));
-  return Math.max(1, Math.round(framesPerPage / 3));
+function hex(bytes) {
+  return Array.from(bytes, (byte) => byte.toString(16).padStart(2, '0')).join('');
 }
-
-function sha256(bytes) {
-  return createHash('sha256').update(bytes).digest('hex');
-}
-
-function cborByteStringHeaderLength(length) {
-  if (length < 24) return 1;
-  if (length <= 0xff) return 2;
-  if (length <= 0xffff) return 3;
-  if (length <= 0xffffffff) return 5;
-  return 9;
-}
-
-/** Size the padded page payload so its CBOR byte string is exactly K MUR fragments. */
-function calculatePageChunkCapacity(maxFragmentLength, dataFramesPerPage) {
-  const targetLength = maxFragmentLength * dataFramesPerPage;
-  if (!Number.isSafeInteger(targetLength)) throw new Error('Page fragment capacity is too large.');
-  let chunkCapacity = targetLength - PAGE_ENVELOPE_HEADER_LENGTH - 9;
-  for (let iteration = 0; iteration < 10; iteration += 1) {
-    const envelopeLength = PAGE_ENVELOPE_HEADER_LENGTH + chunkCapacity;
-    const next = targetLength - PAGE_ENVELOPE_HEADER_LENGTH - cborByteStringHeaderLength(envelopeLength);
-    if (next === chunkCapacity) break;
-    chunkCapacity = next;
-  }
-  const envelopeLength = PAGE_ENVELOPE_HEADER_LENGTH + chunkCapacity;
-  if (chunkCapacity < 1 || envelopeLength + cborByteStringHeaderLength(envelopeLength) !== targetLength) {
-    throw new Error('Could not calculate a valid page payload size for this fragment length.');
-  }
-  return chunkCapacity;
-}
-
-const AUTO_FRAME_REDUNDANCY = 0.10;
 
 async function encodeCommand(inputPath, options) {
   if (!options.out) throw new Error('encode requires --out <directory>.');
-  const requestedFrameCount = options.frames
-    ? positiveInteger(options.frames, '--frames')
-    : undefined;
-  const requestedMaxFragmentLength = options.max_fragment_length === undefined
-    ? undefined
-    : positiveInteger(options.max_fragment_length, '--max-fragment-length');
-  const requestedQrVersion = options.qr_version === undefined
-    ? undefined
-    : positiveInteger(options.qr_version, '--qr-version');
-  if (requestedQrVersion !== undefined && requestedQrVersion > 40) {
-    throw new Error('--qr-version must be between 1 and 40.');
+  const input = new Uint8Array(await readFile(inputPath));
+  const grid = options.grid === undefined ? { columns: 4, rows: 4 } : parseGrid(options.grid);
+  const cellsPerPage = grid.columns * grid.rows;
+  if (!Number.isSafeInteger(cellsPerPage) || cellsPerPage > 255) {
+    throw new Error('--grid must contain between 1 and 255 cells.');
   }
-  const grid = options.grid === undefined ? undefined : parseGrid(options.grid);
-  const fountainScope = options.fountain_scope ?? 'global';
-  const pageRedundancy = options.page_redundancy ?? 'default';
-  if (!['global', 'page', 'both'].includes(fountainScope)) {
-    throw new Error('--fountain-scope must be global, page or both.');
+  const repairSymbols = options.repair_symbols === undefined
+    ? Math.max(1, Math.round(cellsPerPage * 2 / 16))
+    : positiveInteger(options.repair_symbols, '--repair-symbols');
+  if (repairSymbols >= cellsPerPage) {
+    throw new Error('--repair-symbols must be less than the number of grid cells.');
   }
-  if (!['default', 'low'].includes(pageRedundancy)) {
-    throw new Error('--page-redundancy must be default or low.');
-  }
-  if (options.page_redundancy !== undefined && fountainScope === 'global') {
-    throw new Error('--page-redundancy requires --fountain-scope page or both.');
-  }
-  if ((fountainScope === 'page' || fountainScope === 'both') && grid === undefined) {
-    throw new Error(`--fountain-scope ${fountainScope} requires --grid.`);
-  }
-  const gridGap = options.grid_gap === undefined
-    ? 24
-    : nonNegativeInteger(options.grid_gap, '--grid-gap');
-  if (options.grid_gap !== undefined && grid === undefined) {
-    throw new Error('--grid-gap requires --grid.');
-  }
-  const gridPadding = options.grid_padding === undefined
-    ? 48
-    : nonNegativeInteger(options.grid_padding, '--grid-padding');
-  if (options.grid_padding !== undefined && grid === undefined) {
-    throw new Error('--grid-padding requires --grid.');
-  }
+  const sourceSymbols = cellsPerPage - repairSymbols;
+  const qrVersion = positiveInteger(options.qr_version ?? '21', '--qr-version');
+  if (qrVersion > 40) throw new Error('--qr-version must be between 1 and 40.');
   const size = positiveInteger(options.size ?? '512', '--size');
-  const correction = options.correction ?? 'medium';
-  const format = options.format ?? 'both';
+  const correction = options.correction ?? 'low';
   if (!['low', 'medium', 'quartile', 'high'].includes(correction)) {
     throw new Error('--correction must be low, medium, quartile or high.');
   }
-  if (!['both', 'png', 'ur'].includes(format)) {
-    throw new Error('--format must be both, png or ur.');
-  }
-  if (grid !== undefined && format === 'ur') {
-    throw new Error('--grid requires --format png or both.');
-  }
-  if ((fountainScope === 'page' || fountainScope === 'both') && requestedFrameCount !== undefined) {
-    throw new Error(`--frames cannot be used with --fountain-scope ${fountainScope}; page sessions use the grid capacity as their frame count.`);
-  }
-
-  const input = await readFile(inputPath);
-  const inputBytes = new Uint8Array(input);
-  const maxFragmentLength = requestedMaxFragmentLength
-    ?? chooseMaxFragmentLength(
-      inputBytes,
-      correction,
-      requestedQrVersion,
-      requestedFrameCount ?? (grid && fountainScope !== 'global' ? grid.columns * grid.rows : undefined),
-      grid && fountainScope !== 'global'
-        ? grid.columns * grid.rows - pageRepairFrameCount(grid.columns * grid.rows, pageRedundancy)
-        : undefined,
-    );
-  const encoder = new FileEncoder(inputBytes, { maxFragmentLength });
-  const automaticFrameCount = encoder.isSinglePart
-    ? 1
-    : Math.ceil(encoder.sourcePartCount * (1 + AUTO_FRAME_REDUNDANCY));
-  const frameCount = encoder.isSinglePart
-    ? 1
-    : requestedFrameCount ?? automaticFrameCount;
-
+  const format = options.format ?? 'both';
+  if (!['both', 'png', 'mqr'].includes(format)) throw new Error('--format must be both, png or mqr.');
+  const gap = options.grid_gap === undefined ? 24 : nonNegativeInteger(options.grid_gap, '--grid-gap');
+  const padding = options.grid_padding === undefined
+    ? 48
+    : nonNegativeInteger(options.grid_padding, '--grid-padding');
+  const symbolSize = chooseSymbolSize(correction, qrVersion);
+  const encoder = new FileEncoder(input, { symbolSize, sourceSymbols, repairSymbols });
   const outputDirectory = resolve(options.out);
   await mkdir(outputDirectory, { recursive: true });
   const existing = await readdir(outputDirectory);
-  if (existing.length > 0 && !options.force) {
+  if (existing.length && !options.force) {
     throw new Error(`Output directory is not empty: ${outputDirectory} (use --force to overwrite files).`);
   }
-  if (fountainScope === 'both') {
-    const framesPerPage = grid.columns * grid.rows;
-    if (framesPerPage < 3) {
-      throw new Error('--grid needs at least 3 cells so each page can contain source and recovery symbols.');
-    }
-    if (framesPerPage > 255) throw new Error('Page-scoped grids support at most 255 QR cells.');
-    const repairFramesPerPage = pageRepairFrameCount(framesPerPage, pageRedundancy);
-    if (framesPerPage - repairFramesPerPage < 2) {
-      throw new Error('--grid must leave at least two data frames per page.');
-    }
 
-    const globalDirectory = join(outputDirectory, 'global');
-    const pageDirectory = join(outputDirectory, 'page');
-
-    await encodeCommand(inputPath, {
-      ...options,
-      out: globalDirectory,
-      fountain_scope: 'global',
-      page_redundancy: undefined,
-    });
-    await encodeCommand(inputPath, {
-      ...options,
-      out: pageDirectory,
-      fountain_scope: 'page',
-      page_redundancy: pageRedundancy,
-    });
-
-    const globalManifest = JSON.parse(await readFile(join(globalDirectory, 'manifest.json'), 'utf8'));
-    const pageManifest = JSON.parse(await readFile(join(pageDirectory, 'manifest.json'), 'utf8'));
-    const manifest = {
-      format: 'MUR-BOTH',
-      fountainScope: 'both',
-      urType: 'bytes',
-      originalFilename: basename(inputPath),
-      originalSize: input.byteLength,
-      sha256: sha256(inputBytes),
-      grid: {
-        columns: grid.columns,
-        rows: grid.rows,
-      },
-      transfers: {
-        global: {
-          directory: 'global',
-          format: globalManifest.format,
-          frameCount: globalManifest.frameCount,
-          sourcePartCount: globalManifest.sourcePartCount,
-          pageCount: globalManifest.grid?.pageCount ?? null,
-        },
-        page: {
-          directory: 'page',
-          format: pageManifest.format,
-          frameCount: pageManifest.frameCount,
-          sourcePartCount: pageManifest.sourcePartCount,
-          pageCount: pageManifest.grid.pageCount,
-          dataFramesPerPage: pageManifest.grid.dataFramesPerPage,
-          repairFramesPerPage: pageManifest.grid.repairFramesPerPage,
-        },
-      },
-      generatedBy: `murfile/${VERSION}`,
-      protocol: 'Blockchain Commons BCR-2020-005 + BCR-2024-001',
-    };
-    await writeFile(join(outputDirectory, 'manifest.json'), `${JSON.stringify(manifest, null, 2)}\n`, 'utf8');
-
-    console.log(`Encoded both Fountain scopes: ${inputPath}`);
-    console.log(`Global transfer: ${globalManifest.frameCount} frames in ${globalManifest.grid.pageCount} visual pages`);
-    console.log(`Page transfer:  ${pageManifest.frameCount} frames in ${pageManifest.grid.pageCount} independent sessions`);
-    console.log(`Output:         ${outputDirectory}`);
-    return;
-  }
-
-  // Page scope creates one independent MDS-coded session per printed page.
-  if (grid && fountainScope === 'page') {
-    const framesPerPage = grid.columns * grid.rows;
-    if (framesPerPage < 3) {
-      throw new Error('--grid needs at least 3 cells so each page can contain source and recovery symbols.');
-    }
-    if (framesPerPage > 255) throw new Error('Page-scoped grids support at most 255 QR cells.');
-    const repairFramesPerPage = pageRepairFrameCount(framesPerPage, pageRedundancy);
-    const dataFramesPerPage = framesPerPage - repairFramesPerPage;
-    if (dataFramesPerPage < 2) {
-      throw new Error('--grid must leave at least two data frames per page.');
-    }
-
-    const chunkCapacity = calculatePageChunkCapacity(maxFragmentLength, dataFramesPerPage);
-    const pageCount = Math.max(1, Math.ceil(inputBytes.byteLength / chunkCapacity));
-    if (pageCount > 0xffffffff) throw new Error('Page count exceeds the page-transfer format limit.');
-    const totalFrameCount = pageCount * framesPerPage;
-    const totalSourcePartCount = pageCount * dataFramesPerPage;
-    const fileHash = sha256(inputBytes);
-    const pageDigits = String(pageCount).length;
-    const frameDigits = String(framesPerPage).length;
-    let firstQrModules = null;
-
-    for (let pageIndex = 0; pageIndex < pageCount; pageIndex += 1) {
-      const chunkStart = pageIndex * chunkCapacity;
-      const chunkLength = Math.max(0, Math.min(chunkCapacity, inputBytes.byteLength - chunkStart));
-      const chunk = new Uint8Array(chunkCapacity);
-      chunk.set(inputBytes.subarray(chunkStart, chunkStart + chunkLength));
-      const envelope = createPageEnvelope({
-        pageIndex,
-        pageCount,
-        originalSize: inputBytes.byteLength,
-        chunkLength,
-        chunk,
-        fileSha256: fileHash,
-      });
-      const { fragments: pageFragments, sourcePartCount } = encodePageFragments(
-        envelope,
-        maxFragmentLength,
-        framesPerPage,
-      );
-      if (sourcePartCount !== dataFramesPerPage) {
-        throw new Error(
-          `Internal page sizing error: page ${pageIndex + 1} has ${sourcePartCount} ` +
-          `source fragments; expected ${dataFramesPerPage}.`,
-        );
-      }
-      if (pageFragments.length !== framesPerPage) {
-        throw new Error(`Page ${pageIndex + 1} did not produce ${framesPerPage} frames.`);
-      }
-
-      const pageImages = [];
-      for (let frameIndex = 0; frameIndex < pageFragments.length; frameIndex += 1) {
-        const fragment = pageFragments[frameIndex];
-        const modules = qrModulesForFragment(fragment, correction, requestedQrVersion);
-        if (requestedQrVersion !== undefined && modules !== 17 + 4 * requestedQrVersion) {
-          throw new Error(`Page ${pageIndex + 1}, frame ${frameIndex + 1} does not fit QR version ${requestedQrVersion}.`);
-        }
-        if (firstQrModules === null) firstQrModules = modules;
-
-        const pageStem = `page-${String(pageIndex + 1).padStart(pageDigits, '0')}`;
-        const frameStem = `${pageStem}-frame-${String(frameIndex + 1).padStart(frameDigits, '0')}`;
-        if (format === 'both') {
-          await writeFile(join(outputDirectory, `${frameStem}.ur.txt`), `${fragment}\n`, 'utf8');
-        }
-
-        const image = renderQrFragment(fragment, {
-          size,
-          correction,
-          version: requestedQrVersion,
-        });
-        pageImages.push(image);
-      }
-
-      const pageImage = composeGridPage(pageImages, {
-        size,
-        columns: grid.columns,
-        rows: grid.rows,
-        gap: gridGap,
-        padding: gridPadding,
-      });
-      const pageName = `page-${String(pageIndex + 1).padStart(pageDigits, '0')}.png`;
-      await writeFile(join(outputDirectory, pageName), pageImage.toPng());
-    }
-
-    const actualQrVersion = (firstQrModules - 17) / 4;
-    const manifest = {
-      format: 'MUR-PAGES',
-      fountainScope,
-      urType: 'murpage',
-      payloadUrType: 'bytes',
-      originalFilename: basename(inputPath),
-      originalSize: input.byteLength,
-      sha256: fileHash,
-      frameCount: totalFrameCount,
-      sourcePartCount: totalSourcePartCount,
-      sourcePartCountPerPage: dataFramesPerPage,
-      repairFramesPerPage,
-      pageRedundancy,
-      pageCode: 'vandermonde-gf256-v1',
-      maxFragmentLength,
-      qr: { size, correction, version: actualQrVersion, modules: firstQrModules },
-      grid: {
-        columns: grid.columns,
-        rows: grid.rows,
-        gap: gridGap,
-        padding: gridPadding,
-        framesPerPage,
-        pageCount,
-        dataFramesPerPage,
-        repairFramesPerPage,
-        pageRedundancy,
-        pageCode: 'vandermonde-gf256-v1',
-        guaranteedErasures: repairFramesPerPage,
-        ordering: 'row-major',
-        fountainScope,
-        urType: 'murpage',
-      },
-      generatedBy: `murfile/${VERSION}`,
-      protocol: 'Blockchain Commons BCR-2020-005 + BCR-2024-001; Murfile page MDS v1',
-    };
-    await writeFile(join(outputDirectory, 'manifest.json'), `${JSON.stringify(manifest, null, 2)}\n`, 'utf8');
-
-    console.log(`Encoded: ${inputPath}`);
-    console.log(`Bytes:   ${input.byteLength}`);
-    console.log(`SHA-256: ${manifest.sha256}`);
-    console.log(`Pages:   ${pageCount}`);
-    console.log(`Frames:  ${totalFrameCount} (${framesPerPage} per page)`);
-    console.log(`Output:  ${outputDirectory}`);
-    console.log(`Format:  ${format}`);
-    console.log(`QR:      version ${actualQrVersion} (${firstQrModules} modules)`);
-    console.log(`Grid:    ${grid.columns}x${grid.rows}, ${pageCount} independent page-code sessions`);
-    console.log(`Per page: ${dataFramesPerPage} source blocks -> ${framesPerPage} mixed MDS symbols`);
-    return;
-  }
-
-  if (!encoder.isSinglePart && frameCount < encoder.sourcePartCount) {
-    throw new Error(`--frames must be at least ${encoder.sourcePartCount} for this file; increase it for loss tolerance.`);
-  }
-
-  const fragments = encoder.take(frameCount);
-  if (fragments.length !== frameCount) {
-    throw new Error('The encoder ended before the requested frame count.');
-  }
-
-  const firstQrModules = qrModulesForFragment(fragments[0], correction, requestedQrVersion);
-  if (requestedQrVersion !== undefined) {
-    const expectedModules = 17 + 4 * requestedQrVersion;
-    for (let index = 0; index < fragments.length; index += 1) {
-      const modules = qrModulesForFragment(fragments[index], correction, requestedQrVersion);
-      if (modules !== expectedModules) {
-        throw new Error(`Frame ${index + 1} did not use the requested QR version ${requestedQrVersion}.`);
+  const frameDigits = String(cellsPerPage).length;
+  const pageDigits = String(encoder.pageCount).length;
+  let firstModules;
+  for (let pageIndex = 0; pageIndex < encoder.pageCount; pageIndex += 1) {
+    const frames = encoder.nextPage();
+    if (!frames || frames.length !== cellsPerPage) throw new Error(`Page ${pageIndex + 1} has an invalid frame count.`);
+    const pageImages = [];
+    for (let frameIndex = 0; frameIndex < frames.length; frameIndex += 1) {
+      const frame = frames[frameIndex];
+      const modules = qrModulesForFragment(frame, correction, qrVersion);
+      if (firstModules === undefined) firstModules = modules;
+      const stem = `page-${String(pageIndex + 1).padStart(pageDigits, '0')}-frame-${String(frameIndex + 1).padStart(frameDigits, '0')}`;
+      if (format !== 'png') await writeFile(join(outputDirectory, `${stem}.mqr.txt`), `${frame}\n`, 'utf8');
+      if (format !== 'mqr') {
+        pageImages.push(renderQrFragment(frame, { size, correction, version: qrVersion }));
       }
     }
-  }
-
-  const actualQrVersion = (firstQrModules - 17) / 4;
-  const width = String(frameCount).length;
-  const framesPerPage = grid ? grid.columns * grid.rows : 1;
-  const pageCount = grid ? Math.ceil(frameCount / framesPerPage) : 0;
-
-  const renderFragment = (fragment) => renderQrFragment(fragment, {
-    size,
-    correction,
-    version: requestedQrVersion,
-  });
-
-  if (grid) {
-    const pageDigits = String(pageCount).length;
-    for (let pageIndex = 0; pageIndex < pageCount; pageIndex += 1) {
-      const pageImages = [];
-      const start = pageIndex * framesPerPage;
-      const end = Math.min(start + framesPerPage, fragments.length);
-
-      for (let index = start; index < end; index += 1) {
-        const stem = `frame-${String(index + 1).padStart(width, '0')}`;
-        const fragment = fragments[index];
-
-        if (format === 'both') {
-          await writeFile(join(outputDirectory, `${stem}.ur.txt`), `${fragment}\n`, 'utf8');
-        }
-        pageImages.push(renderFragment(fragment));
-      }
-
+    if (format !== 'mqr') {
       const page = composeGridPage(pageImages, {
         size,
         columns: grid.columns,
         rows: grid.rows,
-        gap: gridGap,
-        padding: gridPadding,
+        gap,
+        padding,
       });
       const pageName = `page-${String(pageIndex + 1).padStart(pageDigits, '0')}.png`;
       await writeFile(join(outputDirectory, pageName), page.toPng());
     }
-  } else {
-    for (let index = 0; index < fragments.length; index += 1) {
-      const stem = `frame-${String(index + 1).padStart(width, '0')}`;
-      const fragment = fragments[index];
-
-      if (format === 'both' || format === 'ur') {
-        await writeFile(join(outputDirectory, `${stem}.ur.txt`), `${fragment}\n`, 'utf8');
-      }
-      if (format === 'both' || format === 'png') {
-        const image = renderFragment(fragment);
-        await writeFile(join(outputDirectory, `${stem}.png`), image.toPng());
-      }
-    }
   }
 
   const manifest = {
-    format: encoder.isSinglePart ? 'UR' : 'MUR',
-    fountainScope,
-    urType: 'bytes',
+    format: 'MQR1',
+    protocol: 'RaptorQ RFC 6330 + Base45 RFC 9285',
     originalFilename: basename(inputPath),
     originalSize: input.byteLength,
-    sha256: sha256(input),
-    frameCount,
-    sourcePartCount: encoder.sourcePartCount,
-    maxFragmentLength,
-    qr: {
-      size: format === 'ur' ? null : size,
-      correction,
-      version: actualQrVersion,
-      modules: firstQrModules,
-    },
-    grid: grid ? {
+    sha256: hex(sha256(input)),
+    transferId: encoder.transferId,
+    pageCount: encoder.pageCount,
+    frameCount: encoder.frameCount,
+    sourceSymbolCount: encoder.sourceSymbolCount,
+    qr: { size, correction, version: qrVersion, modules: firstModules },
+    grid: {
       columns: grid.columns,
       rows: grid.rows,
-      gap: gridGap,
-      padding: gridPadding,
-      framesPerPage,
-      pageCount,
+      gap,
+      padding,
+      framesPerPage: cellsPerPage,
+      sourceSymbols,
+      repairSymbols,
+      symbolSize,
       ordering: 'row-major',
-      fountainScope,
-    } : null,
+    },
     generatedBy: `murfile/${VERSION}`,
-    protocol: 'Blockchain Commons BCR-2020-005 + BCR-2024-001',
   };
   await writeFile(join(outputDirectory, 'manifest.json'), `${JSON.stringify(manifest, null, 2)}\n`, 'utf8');
-
   console.log(`Encoded: ${inputPath}`);
   console.log(`Bytes:   ${input.byteLength}`);
   console.log(`SHA-256: ${manifest.sha256}`);
-  console.log(`Frames:  ${frameCount}`);
+  console.log(`Pages:   ${encoder.pageCount} · ${cellsPerPage} frames/page · ${sourceSymbols} source + ${repairSymbols} repair`);
+  console.log(`QR:      version ${qrVersion}-${correction} profile (${symbolSize} bytes/symbol)`);
   console.log(`Output:  ${outputDirectory}`);
-  console.log(`Format:  ${format}`);
-  console.log(`QR:      version ${actualQrVersion} (${firstQrModules} modules)`);
-  if (grid) console.log(`Grid:    ${grid.columns}x${grid.rows}, ${pageCount} pages, ${gridGap}px gap, ${gridPadding}px padding`);
-  console.log(`Fountain scope: ${fountainScope}`);
-  if (!encoder.isSinglePart) console.log(`Source fragments: ${encoder.sourcePartCount}; exported fragments include fountain redundancy.`);
 }
 
 async function collectFiles(path) {
@@ -566,43 +194,38 @@ async function collectFiles(path) {
   for (const entry of entries.sort((a, b) => a.name.localeCompare(b.name))) {
     const fullPath = join(absolute, entry.name);
     if (entry.isDirectory()) files.push(...await collectFiles(fullPath));
-    else if (entry.isFile() && /\.(?:ur|txt)$/i.test(entry.name)) files.push(fullPath);
+    else if (entry.isFile() && /\.(?:mqr|txt)$/i.test(entry.name)) files.push(fullPath);
   }
   return files;
 }
 
-async function readInputTexts(inputPath) {
+async function readInputs(inputPath) {
   if (inputPath === '-') {
     let text = '';
     for await (const chunk of process.stdin) text += chunk;
     return [{ source: 'stdin', text }];
   }
-
   const absolute = resolve(inputPath);
   try {
     const files = await collectFiles(absolute);
-    return await Promise.all(files.map(async (file) => ({ source: file, text: await readFile(file, 'utf8') })));
+    return await Promise.all(files.map(async (file) => ({
+      source: file,
+      text: await readFile(file, 'utf8'),
+    })));
   } catch (error) {
     if (error?.code !== 'ENOTDIR') throw error;
     return [{ source: absolute, text: await readFile(absolute, 'utf8') }];
   }
 }
 
-function extractUrStrings(text) {
-  return String(text)
-    .split(/\s+/)
-    .map((token) => token.trim())
-    .filter((token) => /^ur:/i.test(token));
-}
-
 async function collectDecoder(inputPath) {
   const decoder = new FileDecoder();
   let totalCandidates = 0;
-  const sources = await readInputTexts(inputPath);
+  const sources = await readInputs(inputPath);
   for (const source of sources) {
-    const fragments = extractUrStrings(source.text);
-    totalCandidates += fragments.length;
-    decoder.addMany(fragments);
+    const frames = source.text.split(/\r?\n/).filter((line) => line.startsWith(MQR_PREFIX));
+    totalCandidates += frames.length;
+    decoder.addMany(frames);
   }
   return { decoder, totalCandidates, sources };
 }
@@ -626,67 +249,60 @@ async function decodeCommand(inputPath, options) {
   const status = decoder.status;
   if (!decoder.complete) {
     throw new Error(
-      `Incomplete transfer: ${status.fragmentsReceived} accepted fragments, ` +
-      `${status.progress.toFixed(3)} fountain progress, ${status.invalidUris} invalid URs. ` +
-      `Collected ${totalCandidates} UR strings.`,
+      `Incomplete MQR transfer: ${status.fragmentsReceived} accepted frames, ` +
+      `${status.progress.toFixed(3)} progress, ${status.invalidFrames} invalid frames. ` +
+      `Missing pages: ${status.missingPages.map((index) => index + 1).join(', ') || 'none known'}. ` +
+      `Collected ${totalCandidates} MQR frames.`,
     );
   }
-
   const bytes = decoder.result;
-  const actualHash = sha256(bytes);
-  if (status.expectedSha256 && actualHash !== status.expectedSha256) {
-    throw new Error(`Reconstructed file hash mismatch: expected ${status.expectedSha256}, got ${actualHash}.`);
-  }
   await atomicWrite(options.out, bytes);
   console.log(`Decoded: ${options.out}`);
   console.log(`Bytes:   ${bytes.byteLength}`);
-  console.log(`SHA-256: ${actualHash}`);
-  console.log(`URs:     ${totalCandidates} read`);
-  if (status.pageCount !== null) console.log(`Pages:   ${status.completedPages}/${status.pageCount} independently reconstructed`);
+  console.log(`SHA-256: ${hex(sha256(bytes))}`);
+  console.log(`Frames:  ${totalCandidates} read`);
 }
 
 async function inspectCommand(inputPath, options) {
   const { decoder, totalCandidates, sources } = await collectDecoder(inputPath);
   const status = decoder.status;
-  const result = {
+  const report = {
     input: inputPath,
     sourceFiles: sources.length,
-    urStringsRead: totalCandidates,
+    mqrFramesRead: totalCandidates,
     mode: status.mode,
     complete: status.complete,
-    fountainProgress: status.progress,
-    acceptedFragments: status.fragmentsReceived,
+    progress: status.progress,
+    acceptedFrames: status.fragmentsReceived,
     duplicatesIgnored: status.duplicatesIgnored,
-    redundantFragments: status.redundantFragments,
-    invalidUris: status.invalidUris,
+    redundantFrames: status.redundantFragments,
+    invalidFrames: status.invalidFrames,
     reconstructedBytes: decoder.result?.byteLength ?? null,
     completedPages: status.completedPages,
     pageCount: status.pageCount,
     missingPages: status.missingPages,
-    activeSessions: status.activeSessions,
+    activeBlocks: status.activeSessions,
     expectedSha256: status.expectedSha256,
   };
-
-  if (options.json) console.log(JSON.stringify(result, null, 2));
-  else {
-    console.log(`Input:                 ${result.input}`);
-    console.log(`Source files:          ${result.sourceFiles}`);
-    console.log(`UR strings:            ${result.urStringsRead}`);
-    console.log(`Mode:                  ${result.mode}`);
-    console.log(`Complete:              ${result.complete ? 'yes' : 'no'}`);
-    console.log(`Fountain progress:     ${(result.fountainProgress * 100).toFixed(1)} %`);
-    console.log(`Accepted fragments:    ${result.acceptedFragments}`);
-    console.log(`Duplicates ignored:    ${result.duplicatesIgnored}`);
-    console.log(`Redundant fragments:   ${result.redundantFragments}`);
-    console.log(`Invalid URs:           ${result.invalidUris}`);
-    if (result.reconstructedBytes !== null) console.log(`Reconstructed bytes:   ${result.reconstructedBytes}`);
+  if (options.json) {
+    console.log(JSON.stringify(report, null, 2));
+    return;
   }
+  console.log(`Input:              ${report.input}`);
+  console.log(`MQR frames:         ${report.mqrFramesRead}`);
+  console.log(`Complete:           ${report.complete ? 'yes' : 'no'}`);
+  console.log(`Progress:           ${(report.progress * 100).toFixed(1)} %`);
+  console.log(`Accepted frames:    ${report.acceptedFrames}`);
+  console.log(`Duplicates:         ${report.duplicatesIgnored}`);
+  console.log(`Redundant frames:   ${report.redundantFrames}`);
+  console.log(`Invalid frames:     ${report.invalidFrames}`);
+  console.log(`Pages:              ${report.completedPages}/${report.pageCount ?? '?'}`);
+  if (report.missingPages.length) console.log(`Missing pages:      ${report.missingPages.map((index) => index + 1).join(', ')}`);
 }
 
 async function main() {
-  let parsed;
   try {
-    parsed = parseArgs(process.argv.slice(2));
+    const parsed = parseArgs(process.argv.slice(2));
     if (parsed.command === 'help') {
       console.log(usage());
       return;
@@ -695,18 +311,14 @@ async function main() {
       console.log(VERSION);
       return;
     }
-    const input = parsed.positionals?.[0];
-    if (parsed.command !== 'encode' && parsed.command !== 'decode' && parsed.command !== 'inspect') {
-      throw new Error(`Unknown command: ${parsed.command}`);
-    }
-    if (!input) throw new Error(`${parsed.command} requires an input path (or - for stdin).`);
-
-    if (parsed.command === 'encode') await encodeCommand(input, parsed.options);
-    else if (parsed.command === 'decode') await decodeCommand(input, parsed.options);
-    else await inspectCommand(input, parsed.options);
+    const inputPath = parsed.positionals?.[0];
+    if (!inputPath && parsed.command !== 'help') throw new Error(`${parsed.command} requires an input path.`);
+    if (parsed.command === 'encode') await encodeCommand(inputPath, parsed.options);
+    else if (parsed.command === 'decode') await decodeCommand(inputPath, parsed.options);
+    else if (parsed.command === 'inspect') await inspectCommand(inputPath, parsed.options);
+    else throw new Error(`Unknown command: ${parsed.command}`);
   } catch (error) {
     console.error(`murfile: ${error instanceof Error ? error.message : String(error)}`);
-    console.error('Run "murfile --help" for usage.');
     process.exitCode = 1;
   }
 }

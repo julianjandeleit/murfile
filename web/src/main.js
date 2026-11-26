@@ -54,7 +54,6 @@ let recentEvents = [];
 let selectedCameraId = '';
 
 const FRAME_INTERVAL_MS = 190;
-const MAX_SCAN_WIDTH = 1440;
 const MAX_EVENTS = 7;
 
 function setCameraState(label, state = 'idle') {
@@ -104,7 +103,7 @@ function renderCounters() {
   const status = session.status;
   elements.fragmentCount.textContent = String(status.fragmentsReceived);
   elements.duplicateCount.textContent = String(status.duplicatesIgnored + status.redundantFragments);
-  elements.invalidCount.textContent = String(status.invalidUris);
+  elements.invalidCount.textContent = String(status.invalidFrames);
   elements.qrCount.textContent = String(decodedQrCount);
   elements.decodeProgress.value = status.progress;
   elements.progressLabel.textContent = `${Math.round(status.progress * 100)} %`;
@@ -128,7 +127,7 @@ function resetSession() {
   elements.resultContent.hidden = true;
   elements.filenameInput.value = 'recovered.bin';
   elements.downloadButton.disabled = true;
-  setTransferState('Warte auf UR-Fragmente', 'Richte die Kamera auf einen MUR-QR-Code.');
+  setTransferState('Warte auf MQR1-Frames', 'Richte die Kamera auf einen MQR1-QR-Code.');
   renderCounters();
 }
 
@@ -181,10 +180,11 @@ async function startCamera() {
   elements.startButton.disabled = true;
   setCameraState('Verbinde …', 'starting');
   try {
-    mediaStream = await requestCameraStream(selectedCameraId, {
+    const camera = await requestCameraStream(selectedCameraId, {
       unavailableMessage: 'Dieser Browser stellt keinen Kamerazugriff über getUserMedia bereit.',
       insecureMessage: 'Der Kamerazugriff benötigt HTTPS oder localhost.',
     });
+    mediaStream = camera.stream;
     elements.video.srcObject = mediaStream;
     await elements.video.play();
     elements.videoPlaceholder.hidden = true;
@@ -192,7 +192,13 @@ async function startCamera() {
     elements.cameraSelect.disabled = true;
     const trackSettings = mediaStream.getVideoTracks()[0]?.getSettings?.() || {};
     selectedCameraId = trackSettings.deviceId || selectedCameraId;
-    elements.resolutionLabel.textContent = `${trackSettings.width || elements.video.videoWidth} × ${trackSettings.height || elements.video.videoHeight}`;
+    const actualWidth = camera.resolution.width || trackSettings.width || elements.video.videoWidth;
+    const actualHeight = camera.resolution.height || trackSettings.height || elements.video.videoHeight;
+    const maximum = camera.resolution.maxWidth && camera.resolution.maxHeight
+      ? ` · Max. ${camera.resolution.maxWidth} × ${camera.resolution.maxHeight}`
+      : '';
+    elements.resolutionLabel.textContent =
+      `${actualWidth} × ${actualHeight}${maximum}${camera.resolution.warning ? ` · ${camera.resolution.warning}` : ''}`;
     setCameraState('Live', 'live');
     updateTorchAvailability();
     selectedCameraId = await populateCameraSelect(elements.cameraSelect, selectedCameraId, {
@@ -215,9 +221,8 @@ function submitFrame(timestamp) {
   const sourceHeight = elements.video.videoHeight;
   if (!sourceWidth || !sourceHeight) return;
 
-  const scale = Math.min(1, MAX_SCAN_WIDTH / sourceWidth);
-  const width = Math.max(1, Math.round(sourceWidth * scale));
-  const height = Math.max(1, Math.round(sourceHeight * scale));
+  const width = sourceWidth;
+  const height = sourceHeight;
   if (canvas.width !== width || canvas.height !== height) {
     canvas.width = width;
     canvas.height = height;
@@ -259,7 +264,7 @@ async function showCompletedFile(bytes) {
   elements.fileSize.textContent = formatBytes(completedFile.byteLength);
   elements.filenameInput.value = 'recovered.bin';
   elements.hashValue.textContent = 'SHA-256 wird berechnet …';
-  setTransferState('Datei vollständig rekonstruiert', `${formatBytes(completedFile.byteLength)} erfolgreich aus UR rekonstruiert.`, 'complete');
+  setTransferState('Datei vollständig rekonstruiert', `${formatBytes(completedFile.byteLength)} bytegenau aus MQR1 rekonstruiert.`, 'complete');
   addEvent(`Datei rekonstruiert (${formatBytes(completedFile.byteLength)}).`, 'success');
   try {
     const actualHash = await sha256Hex(completedFile);
@@ -289,8 +294,8 @@ function handleQrTexts(texts) {
       const detail = result.status.pageCount !== null
         ? `${result.status.completedPages}/${result.status.pageCount} Seiten vollständig · ${progress} %`
         : `${result.status.fragmentsReceived} Fragmente · ${progress} % Decodierfortschritt`;
-      setTransferState('MUR-Fragmente werden gesammelt', detail, 'receiving');
-      addEvent(`MUR-Fragment empfangen (${result.status.fragmentsReceived}).`, 'normal');
+      setTransferState('MQR1-Frames werden gesammelt', detail, 'receiving');
+      addEvent(`MQR1-Frame empfangen (${result.status.fragmentsReceived}).`, 'normal');
     } else if (result.kind === 'page-complete') {
       setTransferState(
         'Seite rekonstruiert',
@@ -299,10 +304,10 @@ function handleQrTexts(texts) {
       );
       addEvent(`Seite ${result.pageIndex + 1}/${result.pageCount} rekonstruiert.`, 'success');
     } else if (result.kind === 'redundant' || result.kind === 'duplicate' || result.kind === 'duplicate-page') {
-      // Repeated camera detections and already completed fountain sessions are expected.
+      // Repeated camera detections and already completed pages are expected.
     } else if (result.kind === 'invalid') {
-      addEvent(`UR verworfen: ${result.message}`, 'warning');
-      if (!session.complete) setTransferState('Ungültige UR erkannt', result.message, 'error');
+      addEvent(`MQR1-Frame verworfen: ${result.message}`, 'warning');
+      if (!session.complete) setTransferState('Ungültiger MQR1-Frame', result.message, 'error');
     } else if (result.kind === 'complete' && result.bytes) {
       void showCompletedFile(result.bytes);
     }

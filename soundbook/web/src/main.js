@@ -8,6 +8,7 @@ const elements = {
   video: $('video'),
   videoPlaceholder: $('videoPlaceholder'),
   cameraSelect: $('cameraSelect'),
+  cameraResolution: $('cameraResolution'),
   cameraState: $('cameraState'),
   startButton: $('startButton'),
   stopButton: $('stopButton'),
@@ -35,7 +36,6 @@ const canvas = document.createElement('canvas');
 const context = canvas.getContext('2d', { willReadFrequently: true });
 const qrWorker = new Worker(new URL('../../../web/src/workers/qr-worker.js', import.meta.url), { type: 'module' });
 const FRAME_INTERVAL_MS = 190;
-const MAX_SCAN_WIDTH = 1440;
 
 let mediaStream;
 let animationFrameId = 0;
@@ -72,7 +72,7 @@ function setCameraState(label, live = false) {
 }
 
 function updatePlaybackUi(status) {
-  if (status.format === 'SOUNDBOOK-3') {
+  if (status.format === 'SOUNDBOOK-3' || status.format === 'SOUNDBOOK-4') {
     elements.playbackButton.hidden = status.pageCount === null;
     elements.playbackButton.disabled = !supportsOggOpus || progressivePlayableBytes.byteLength === 0;
     elements.playbackButton.textContent = playbackRequested ? 'Pause playback'
@@ -286,7 +286,7 @@ function renderStatus() {
   elements.activeCount.textContent = String(status.activeSessions.length);
   elements.fragmentCount.textContent = String(status.fragmentsReceived);
   elements.qrCount.textContent = String(decodedQrCount);
-  elements.errorCount.textContent = `${status.duplicatesIgnored + status.redundantFragments} / ${status.invalidUris}`;
+  elements.errorCount.textContent = `${status.duplicatesIgnored + status.redundantFragments} / ${status.invalidFrames}`;
 
   if (status.pageCount === null) {
     elements.pageList.innerHTML = '<span class="muted">Page details will appear after the first page is validated.</span>';
@@ -318,7 +318,7 @@ function renderStatus() {
     const nextMissing = status.missingPages[0];
     if (status.complete) {
       elements.statusTitle.textContent = 'All pages reconstructed and verified';
-      const description = status.format === 'SOUNDBOOK-3'
+      const description = status.format === 'SOUNDBOOK-3' || status.format === 'SOUNDBOOK-4'
         ? 'byte-identical original Ogg Opus bytes'
         : 'chained Ogg bytes';
       elements.statusDetail.textContent = `Book ${status.bookId} · ${status.audioBytes.toLocaleString()} ${description} · ` +
@@ -328,7 +328,7 @@ function renderStatus() {
       if (status.format === 'SOUNDBOOK-1') {
         elements.statusDetail.textContent =
           `${status.completedPages} of ${status.pageCount} legacy pages complete. Playback waits for the full Ogg stream.`;
-      } else if (status.format === 'SOUNDBOOK-3') {
+      } else if (status.format === 'SOUNDBOOK-3' || status.format === 'SOUNDBOOK-4') {
         elements.statusDetail.textContent =
           `${status.completedPages} of ${status.pageCount} pages complete; ` +
           `${status.missingPages.length} page(s) remain. ${status.contiguousPageCount} page(s) from the start are contiguous. ` +
@@ -378,7 +378,8 @@ function renderStatus() {
 }
 
 async function startCamera() {
-  mediaStream = await requestCameraStream(selectedCameraId);
+  const camera = await requestCameraStream(selectedCameraId);
+  mediaStream = camera.stream;
   elements.video.srcObject = mediaStream;
   await elements.video.play();
   elements.videoPlaceholder.hidden = true;
@@ -386,6 +387,13 @@ async function startCamera() {
   elements.stopButton.disabled = false;
   elements.cameraSelect.disabled = true;
   setCameraState('Scanning', true);
+  const actualWidth = camera.resolution.width || elements.video.videoWidth;
+  const actualHeight = camera.resolution.height || elements.video.videoHeight;
+  const maximum = camera.resolution.maxWidth && camera.resolution.maxHeight
+    ? ` (max ${camera.resolution.maxWidth}×${camera.resolution.maxHeight})`
+    : '';
+  elements.cameraResolution.textContent =
+    `Scanning at ${actualWidth}×${actualHeight}${maximum}${camera.resolution.warning ? ` — ${camera.resolution.warning}` : ''}`;
   selectedCameraId = await populateCameraSelect(elements.cameraSelect, selectedCameraId);
   elements.cameraSelect.disabled = true;
   lastFrameAt = 0;
@@ -413,9 +421,8 @@ function submitFrame() {
   const sourceWidth = elements.video.videoWidth;
   const sourceHeight = elements.video.videoHeight;
   if (!sourceWidth || !sourceHeight) return;
-  const scale = Math.min(1, MAX_SCAN_WIDTH / sourceWidth);
-  const width = Math.max(1, Math.round(sourceWidth * scale));
-  const height = Math.max(1, Math.round(sourceHeight * scale));
+  const width = sourceWidth;
+  const height = sourceHeight;
   if (canvas.width !== width || canvas.height !== height) {
     canvas.width = width;
     canvas.height = height;

@@ -3,7 +3,7 @@
   "version": "0.1.0",
   "private": true,
   "type": "module",
-  "description": "File-oriented encoder, decoder, CLI and local live reader for Blockchain Commons Multipart UR.",
+  "description": "RaptorQ-based multi-QR file transfer with optional grid pages.",
   "license": "MIT",
   "engines": {
     "node": ">=22.12.0"
@@ -16,6 +16,11 @@
     ".": "./src/index.js",
     "./encoder": "./src/encoder.js",
     "./decoder": "./src/decoder.js",
+    "./raptorq": {
+      "node": "./src/raptorq/node.js",
+      "browser": "./src/raptorq/browser.js",
+      "default": "./src/raptorq/browser.js"
+    },
     "./qr-grid": "./src/qr-grid.js",
     "./soundbook": "./src/soundbook.js",
     "./soundbook/encoder": "./src/soundbook-encoder.js"
@@ -30,14 +35,14 @@
     "build:site": "npm run build && npm run build:soundbook && node scripts/write-site-index.js",
     "preview": "vite preview --config vite.config.js",
     "cli": "node ./bin/murfile.js",
-    "cli:soundbook": "node ./bin/soundbook.js",
-    "build:qr-fixed": "node ./scripts/build-fixed-qr.js"
+    "cli:soundbook": "node ./bin/soundbook.js"
   },
   "dependencies": {
-    "@blockchaincommons/dcbor": "1.0.0-beta.3",
-    "@blockchaincommons/multipart-ur": "1.0.0-beta.5",
-    "@blockchaincommons/uniform-resources": "1.0.0-beta.5",
-    "@undecaf/zbar-wasm": "0.11.0"
+    "@noble/hashes": "2.4.0",
+    "@undecaf/zbar-wasm": "0.11.0",
+    "fast-png": "8.0.0",
+    "qrcode": "1.5.4",
+    "raptorq": "1.7.24"
   },
   "devDependencies": {
     "vite": "^7.0.0"

@@ -9,7 +9,7 @@ import {
 } from '../src/soundbook-encoder.js';
 import { completeOggPrefixLength, isOggOpus } from '../src/ogg-stream.js';
 
-const VERSION = '0.1.0';
+const VERSION = '0.2.0';
 
 function usage() {
   return `soundbook ${VERSION}
@@ -22,10 +22,12 @@ Usage:
 Options:
   --out <dir>                        Output directory (required)
   --grid <columns>x<rows>             Grid size (default: 4x4)
-  --qr-version <version>              QR version 1-40 (default: 20)
+  --qr-version <version>              QR version 1-40 (default: 21)
   --correction <level>                low|medium|quartile|high (default: low)
   --size <pixels>                     QR image side length (default: 512)
-  --fountain-redundancy <profile>     minimal|low|default (max missing cells; default: minimal)
+  --repair-symbols <count>             RaptorQ repair symbols per page (default: 2 on 4x4)
+  --grid-gap <pixels>                  Gap between grid cells (default: 24)
+  --grid-padding <pixels>              Outer grid margin (default: 48)
   --force                             Allow writing into a non-empty directory
 
 The input must be an Ogg Opus file. Its audio bytes are never transcoded or modified.
@@ -41,7 +43,7 @@ function parseArgs(argv) {
   const options = {};
   const valued = new Set([
     '--out', '--grid', '--qr-version', '--correction', '--size',
-    '--fountain-redundancy', '--grid-gap', '--grid-padding',
+    '--repair-symbols', '--grid-gap', '--grid-padding',
   ]);
   for (let index = 0; index < args.length; index += 1) {
     const arg = args[index];
@@ -67,6 +69,14 @@ function positiveInteger(value, label) {
   const number = Number(value);
   if (!Number.isSafeInteger(number) || number < 1) {
     throw new Error(`${label} must be a positive safe integer.`);
+  }
+  return number;
+}
+
+function nonNegativeInteger(value, label) {
+  const number = Number(value);
+  if (!Number.isSafeInteger(number) || number < 0) {
+    throw new Error(`${label} must be a non-negative safe integer.`);
   }
   return number;
 }
@@ -113,19 +123,18 @@ function probeOggOpus(inputPath) {
 async function encode(inputPath, options) {
   if (!options.out) throw new Error('encode requires --out <directory>.');
   const grid = options.grid === undefined ? { columns: 4, rows: 4 } : parseGrid(options.grid);
-  const qrVersion = positiveInteger(options.qr_version ?? '20', '--qr-version');
+  const qrVersion = positiveInteger(options.qr_version ?? '21', '--qr-version');
   if (qrVersion > 40) throw new Error('--qr-version must be between 1 and 40.');
   const size = positiveInteger(options.size ?? '512', '--size');
   const correction = options.correction ?? 'low';
   if (!['low', 'medium', 'quartile', 'high'].includes(correction)) {
     throw new Error('--correction must be low, medium, quartile or high.');
   }
-  const redundancy = options.fountain_redundancy ?? 'minimal';
-  if (!['minimal', 'low', 'default'].includes(redundancy)) {
-    throw new Error('--fountain-redundancy must be minimal, low or default.');
-  }
-  const gap = positiveInteger(options.grid_gap ?? '24', '--grid-gap');
-  const padding = positiveInteger(options.grid_padding ?? '48', '--grid-padding');
+  const repairSymbols = options.repair_symbols === undefined
+    ? undefined
+    : positiveInteger(options.repair_symbols, '--repair-symbols');
+  const gap = nonNegativeInteger(options.grid_gap ?? '24', '--grid-gap');
+  const padding = nonNegativeInteger(options.grid_padding ?? '48', '--grid-padding');
   const inputPathResolved = resolve(inputPath);
   const outputDirectory = resolve(options.out);
   await mkdir(outputDirectory, { recursive: true });
@@ -150,7 +159,7 @@ async function encode(inputPath, options) {
     qrVersion,
     gap,
     padding,
-    redundancy,
+    repairSymbols,
   };
   const sizingPlan = createSoundbookPagePlan(audio, planOptions);
   const chunkHashes = Array.from({ length: sizingPlan.pageCount }, (_, pageIndex) => {
@@ -169,7 +178,7 @@ async function encode(inputPath, options) {
     await writeFile(join(outputDirectory, `${pageStem}.png`), page.png);
     for (let index = 0; index < page.fragments.length; index += 1) {
       const frameStem = `${pageStem}-frame-${String(index + 1).padStart(frameDigits, '0')}`;
-      await writeFile(join(outputDirectory, `${frameStem}.ur.txt`), `${page.fragments[index]}\n`, 'utf8');
+      await writeFile(join(outputDirectory, `${frameStem}.mqr.txt`), `${page.fragments[index]}\n`, 'utf8');
     }
   }
 
@@ -182,7 +191,7 @@ async function encode(inputPath, options) {
   await writeFile(join(outputDirectory, 'manifest.json'), `${JSON.stringify(manifest, null, 2)}\n`, 'utf8');
   console.log(`Encoded: ${inputPathResolved}`);
   console.log(`Audio:   ${(durationMicros / 1_000_000).toFixed(2)} s · ${audio.byteLength} original bytes`);
-  console.log(`Pages:   ${manifest.pageCount} · ${manifest.grid.framesPerPage} mixed symbols/page; recover up to ${manifest.grid.guaranteedErasures} missing`);
+  console.log(`Pages:   ${manifest.pageCount} · ${manifest.grid.sourceSymbols} source + ${manifest.grid.repairSymbols} repair symbols/page`);
   console.log(`Payload: ${manifest.pagePayloadBytes} original audio bytes/page`);
   console.log(`Output:  ${outputDirectory}`);
 }

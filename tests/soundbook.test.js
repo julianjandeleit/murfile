@@ -6,6 +6,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { spawnSync } from 'node:child_process';
 import { FileEncoder } from '../src/encoder.js';
+import { parseMqrFrame } from '../src/index.js';
 import { createSoundbookPagePlan, encodeSoundbookPage } from '../src/soundbook-encoder.js';
 import { SoundbookDecoder as PublicSoundbookDecoder } from 'murfile/soundbook';
 import { SoundbookDecoder } from '../src/soundbook-decoder.js';
@@ -36,6 +37,35 @@ function makePage({ audio, pageIndex, pageCount, chunkCapacity, bookId, audioSha
     durationMicros: 3_000_000,
     audioSha256,
     chunk,
+  });
+}
+
+function makeChunkPage({ audio, pageIndex, pageCount, chunkCapacity, bookId, audioSha256 }) {
+  const offset = pageIndex * chunkCapacity;
+  const chunkLength = Math.min(chunkCapacity, audio.byteLength - offset);
+  const chunk = new Uint8Array(chunkCapacity);
+  chunk.set(audio.subarray(offset, offset + chunkLength));
+  return createSoundbookChunkEnvelope({
+    bookId,
+    pageIndex,
+    pageCount,
+    audioLength: audio.byteLength,
+    chunkLength,
+    chunkCapacity,
+    durationMicros: 3_000_000,
+    audioSha256,
+    chunkSha256: hash(chunk.subarray(0, chunkLength)),
+    chunk,
+  });
+}
+
+function makePageEncoder(envelope, repairSymbols = 2) {
+  const symbolSize = 64;
+  assert.equal(envelope.byteLength % symbolSize, 0);
+  return new FileEncoder(envelope, {
+    symbolSize,
+    sourceSymbols: envelope.byteLength / symbolSize,
+    repairSymbols,
   });
 }
 
@@ -108,7 +138,7 @@ test('Soundbook byte-chunk envelope validates per-chunk hashes and strips paddin
     chunk: new Uint8Array([4, 5, 0]),
   });
   const parsed = parseSoundbookPageEnvelope(envelope);
-  assert.equal(parsed.format, 'SOUNDBOOK-3');
+  assert.equal(parsed.format, 'SOUNDBOOK-4');
   assert.equal(parsed.codec, 'ogg-opus');
   assert.deepEqual(parsed.chunkBytes, new Uint8Array([4, 5]));
   envelope[envelope.length - 1] = 9;
@@ -117,12 +147,12 @@ test('Soundbook byte-chunk envelope validates per-chunk hashes and strips paddin
 
 test('Soundbook decoder accepts interleaved independent pages and verifies the complete book', async () => {
   const audio = new Uint8Array(randomBytes(750));
-  const chunkCapacity = 380;
+  const chunkCapacity = 391;
   const pageCount = Math.ceil(audio.byteLength / chunkCapacity);
   const bookId = randomBytes(16).toString('hex');
   const audioSha256 = hash(audio);
   const pageStreams = Array.from({ length: pageCount }, (_, pageIndex) => {
-    const envelope = makePage({
+    const envelope = makeChunkPage({
       audio,
       pageIndex,
       pageCount,
@@ -130,33 +160,36 @@ test('Soundbook decoder accepts interleaved independent pages and verifies the c
       bookId,
       audioSha256,
     });
-    const encoder = new FileEncoder(envelope, { maxFragmentLength: 160 });
-    assert.equal(encoder.sourcePartCount, 3);
-    return encoder.take(4);
+    const encoder = makePageEncoder(envelope);
+    return encoder.take(encoder.frameCount);
   });
 
   const decoder = new SoundbookDecoder();
-  let finalResult;
-  for (let frameIndex = 0; frameIndex < 4; frameIndex += 1) {
+  let observedPartialBook = false;
+  for (let frameIndex = 0; frameIndex < pageStreams[0].length; frameIndex += 1) {
     for (let pageIndex = 0; pageIndex < pageStreams.length; pageIndex += 1) {
-      finalResult = await decoder.add(pageStreams[pageIndex][frameIndex]);
-      if (frameIndex === 2 && pageIndex === 0) {
-        assert.equal(finalResult.kind, 'page-complete');
-        assert.deepEqual(finalResult.status.missingPages, [1]);
-        assert.equal(finalResult.status.audioAvailable, false);
+      const result = await decoder.add(pageStreams[pageIndex][frameIndex]);
+      if (!observedPartialBook && decoder.status.completedPages === 1) {
+        assert.equal(result.kind, 'page-complete');
+        assert.equal(decoder.status.missingPages.length, 1);
+        assert.equal(decoder.status.audioAvailable, true);
+        observedPartialBook = true;
       }
+      if (decoder.complete) break;
     }
+    if (decoder.complete) break;
   }
 
-  assert.equal(finalResult.kind, 'book-complete');
+  assert.equal(observedPartialBook, true);
+  assert.equal(decoder.complete, true);
   assert.deepEqual(decoder.result, audio);
   assert.equal(decoder.status.completedPages, 2);
   assert.equal(decoder.status.pageCount, 2);
   assert.deepEqual(decoder.status.missingPages, []);
 });
 
-test('Soundbook reconstructs byte-exact chunks and tolerates any single missing QR', async () => {
-  const audio = new Uint8Array(randomBytes(18_000));
+test('Soundbook reconstructs byte-exact chunks across tested single-cell losses', async () => {
+  const audio = new Uint8Array(randomBytes(28_000));
   const planOptions = {
     bookId: randomBytes(16).toString('hex'),
     audioSha256: hash(audio),
@@ -168,13 +201,16 @@ test('Soundbook reconstructs byte-exact chunks and tolerates any single missing 
     return hash(audio.subarray(offset, Math.min(offset + sizingPlan.chunkCapacity, audio.byteLength)));
   });
   const plan = createSoundbookPagePlan(audio, { ...planOptions, chunkHashes });
-  assert.equal(plan.manifest.format, 'SOUNDBOOK-3');
-  assert.equal(plan.manifest.grid.pageCode, 'vandermonde-gf256-v1');
-  assert.equal(plan.manifest.grid.guaranteedErasures, 1);
-  assert.equal(plan.manifest.urType, 'murpage');
+  assert.equal(plan.manifest.format, 'SOUNDBOOK-4');
+  assert.equal(plan.manifest.transport, 'MQR1');
+  assert.equal(plan.manifest.grid.pageCode, 'raptorq-rfc6330');
+  assert.equal(plan.manifest.grid.recoveryModel, 'probabilistic');
   const pages = Array.from({ length: plan.pageCount }, (_, pageIndex) =>
     encodeSoundbookPage(audio, plan, pageIndex));
-  assert.ok(pages[1].fragments.every((fragment) => fragment.startsWith('ur:murpage/')));
+  assert.ok(pages[1].fragments.every((fragment) => fragment.startsWith('MQR1:')));
+  const repairPositions = pages[1].fragments.flatMap((fragment, index) =>
+    parseMqrFrame(fragment).encodingSymbolId >= plan.dataFramesPerPage ? [index] : []);
+  assert.deepEqual(repairPositions, [5, 10]);
 
   for (let missingIndex = 0; missingIndex < plan.framesPerPage; missingIndex += 1) {
     const lossDecoder = new SoundbookDecoder();
@@ -182,6 +218,7 @@ test('Soundbook reconstructs byte-exact chunks and tolerates any single missing 
     for (let index = 0; index < pages[1].fragments.length; index += 1) {
       if (index !== missingIndex) {
         recoveredPage = await lossDecoder.add(pages[1].fragments[index]);
+        if (recoveredPage.kind === 'page-complete') break;
       }
     }
     assert.equal(recoveredPage.kind, 'page-complete', `failed when QR ${missingIndex + 1} was missing`);
@@ -211,40 +248,40 @@ test('Soundbook reconstructs byte-exact chunks and tolerates any single missing 
   assert.deepEqual(decoder.result, audio);
 });
 
-test('Soundbook decoder counts duplicate scans and rejects non-MUR text', async () => {
+test('Soundbook decoder counts duplicate scans and rejects non-MQR text', async () => {
   const audio = new Uint8Array(randomBytes(100));
-  const envelope = makePage({
+  const envelope = makeChunkPage({
     audio,
     pageIndex: 0,
     pageCount: 1,
-    chunkCapacity: 100,
+    chunkCapacity: 135,
     bookId: randomBytes(16).toString('hex'),
     audioSha256: hash(audio),
   });
-  const encoder = new FileEncoder(envelope, { maxFragmentLength: 160 });
+  const encoder = makePageEncoder(envelope);
   const first = encoder.nextFragment();
   const decoder = new SoundbookDecoder();
   assert.equal((await decoder.add(first)).kind, 'fragment');
   assert.equal((await decoder.add(first.toUpperCase())).kind, 'duplicate');
-  assert.equal((await decoder.add('not a QR UR')).kind, 'invalid');
+  assert.equal((await decoder.add('not an MQR1 frame')).kind, 'invalid');
   assert.equal(decoder.status.duplicatesIgnored, 1);
-  assert.equal(decoder.status.invalidUris, 1);
+  assert.equal(decoder.status.invalidFrames, 1);
 });
 
 test('Soundbook decoder rejects a completed book whose audio hash does not match', async () => {
   const audio = new Uint8Array(randomBytes(200));
-  const envelope = makePage({
+  const envelope = makeChunkPage({
     audio,
     pageIndex: 0,
     pageCount: 1,
-    chunkCapacity: audio.byteLength,
+    chunkCapacity: 263,
     bookId: randomBytes(16).toString('hex'),
     audioSha256: '00'.repeat(32),
   });
-  const encoder = new FileEncoder(envelope, { maxFragmentLength: 160 });
+  const encoder = makePageEncoder(envelope);
   const decoder = new SoundbookDecoder();
   let result;
-  for (const fragment of encoder.take(encoder.sourcePartCount + 2)) {
+  for (const fragment of encoder.take(encoder.frameCount)) {
     result = await decoder.add(fragment);
     if (result.kind === 'invalid') break;
   }
@@ -255,23 +292,24 @@ test('Soundbook decoder rejects a completed book whose audio hash does not match
 
 test('Soundbook verifies each reconstructed byte chunk before exposing it', async () => {
   const audio = new Uint8Array(randomBytes(128));
-  const chunk = audio.slice();
+  const chunk = new Uint8Array(135);
+  chunk.set(audio);
   const envelope = createSoundbookChunkEnvelope({
     bookId: randomBytes(16).toString('hex'),
     pageIndex: 0,
     pageCount: 1,
     audioLength: audio.byteLength,
     chunkLength: audio.byteLength,
-    chunkCapacity: audio.byteLength,
+    chunkCapacity: chunk.byteLength,
     durationMicros: 1_000_000,
     audioSha256: hash(audio),
     chunkSha256: '00'.repeat(32),
     chunk,
   });
-  const encoder = new FileEncoder(envelope, { maxFragmentLength: 160 });
+  const encoder = makePageEncoder(envelope);
   const decoder = new SoundbookDecoder();
   let result;
-  for (const fragment of encoder.take(encoder.sourcePartCount + 2)) {
+  for (const fragment of encoder.take(encoder.frameCount)) {
     result = await decoder.add(fragment);
     if (result.kind === 'invalid') break;
   }
@@ -280,16 +318,16 @@ test('Soundbook verifies each reconstructed byte chunk before exposing it', asyn
   assert.deepEqual(decoder.status.availablePages, []);
 });
 
-test('default Soundbook page planning keeps a 250 kB source near 29 pages', () => {
+test('default Soundbook page planning keeps a 250 kB source near 23 pages', () => {
   const source = new Uint8Array(250_000);
   const plan = createSoundbookPagePlan(source, {
     bookId: randomBytes(16).toString('hex'),
     audioSha256: hash(source),
     durationMicros: 30_000_000,
   });
-  assert.ok(plan.chunkCapacity > 7_200);
+  assert.ok(plan.chunkCapacity > 11_000);
   assert.equal(plan.pageCount, Math.ceil(source.byteLength / plan.chunkCapacity));
-  assert.ok(plan.pageCount >= 28 && plan.pageCount <= 30, `${plan.pageCount} pages at ${plan.chunkCapacity} bytes/page`);
+  assert.ok(plan.pageCount >= 22 && plan.pageCount <= 23, `${plan.pageCount} pages at ${plan.chunkCapacity} bytes/page`);
   assert.equal(plan.manifest.byteExact, true);
 });
 
@@ -322,28 +360,27 @@ test('Soundbook CLI preserves the original Ogg Opus bytes and reconstructs them 
     assert.equal(encoded.status, 0, encoded.stderr || encoded.stdout);
 
     const manifest = JSON.parse(await readFile(join(outputDirectory, 'manifest.json'), 'utf8'));
-    assert.equal(manifest.format, 'SOUNDBOOK-3');
+    assert.equal(manifest.format, 'SOUNDBOOK-4');
     assert.equal(manifest.byteExact, true);
     assert.equal(manifest.audioLength, original.byteLength);
     assert.equal(manifest.audioSha256, hash(original));
     assert.equal(manifest.bitrate, undefined);
-    assert.equal(manifest.qr.version, 20);
+    assert.equal(manifest.qr.version, 21);
     assert.equal(manifest.qr.correction, 'low');
     assert.deepEqual([manifest.grid.columns, manifest.grid.rows], [4, 4]);
-    assert.equal(manifest.grid.redundancy, 'minimal');
-    assert.equal(manifest.grid.dataFramesPerPage, 15);
-    assert.equal(manifest.grid.repairFramesPerPage, 1);
+    assert.equal(manifest.grid.sourceSymbols, 14);
+    assert.equal(manifest.grid.repairSymbols, 2);
     assert.ok(
-      manifest.pagePayloadBytes > 7_200,
+      manifest.pagePayloadBytes > 11_000,
       `measured QR version-20 low-ECC payload was ${manifest.pagePayloadBytes} bytes/page`,
     );
 
     const files = await readdir(outputDirectory);
     assert.ok(manifest.pageCount > 1, 'the source should span multiple page-sized byte chunks');
     assert.equal(files.filter((file) => /^page-\d+\.png$/.test(file)).length, manifest.pageCount);
-    assert.equal(files.filter((file) => /^page-\d+-frame-\d+\.ur\.txt$/.test(file)).length, manifest.frameCount);
+    assert.equal(files.filter((file) => /^page-\d+-frame-\d+\.mqr\.txt$/.test(file)).length, manifest.frameCount);
     const decoder = new SoundbookDecoder();
-    const fragmentFiles = files.filter((entry) => /\.ur\.txt$/.test(entry)).sort();
+    const fragmentFiles = files.filter((entry) => /\.mqr\.txt$/.test(entry)).sort();
     let firstPageResult;
     let nextFragmentIndex = 0;
     while (!firstPageResult && nextFragmentIndex < fragmentFiles.length) {

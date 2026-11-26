@@ -3,7 +3,7 @@ import assert from 'node:assert/strict';
 import { parseGrid as parsePublicGrid } from 'murfile/qr-grid';
 import { FileEncoder } from '../src/encoder.js';
 import {
-  chooseMaxFragmentLength,
+  chooseSymbolSize,
   composeGridPage,
   parseGrid,
   qrModulesForFragment,
@@ -37,16 +37,25 @@ test('composeGridPage places images row-major and leaves gaps and padding white'
 });
 
 test('shared renderer enforces the requested fixed QR version', () => {
-  const fragment = new FileEncoder(new Uint8Array([1, 2, 3]), { maxFragmentLength: 100 }).nextFragment();
-  assert.equal(qrModulesForFragment(fragment, 'low', 5), 37);
-  const image = renderQrFragment(fragment, { size: 128, correction: 'low', version: 5 });
-  assert.equal(image.width, 128);
-  assert.equal(image.height, 128);
+  const symbolSize = chooseSymbolSize('low', 21);
+  const fragment = new FileEncoder(new Uint8Array(13 * symbolSize), {
+    symbolSize,
+    sourceSymbols: 13,
+    repairSymbols: 3,
+  }).nextFragment();
+  assert.equal(qrModulesForFragment(fragment, 'low', 21), 101);
+  const image = renderQrFragment(fragment, { size: 512, correction: 'low', version: 21 });
+  assert.equal(image.width, 512);
+  assert.equal(image.height, 512);
 });
 
-test('QR capacity helper chooses a fragment length that fits the requested version', () => {
-  const fragmentLength = chooseMaxFragmentLength(new Uint8Array(2048), 'low', 10, 4);
-  const encoder = new FileEncoder(new Uint8Array(2048), { maxFragmentLength: fragmentLength });
+test('QR capacity helper chooses an aligned RaptorQ symbol size for the requested version', () => {
+  const symbolSize = chooseSymbolSize('low', 10);
+  const encoder = new FileEncoder(new Uint8Array(13 * symbolSize), {
+    symbolSize,
+    sourceSymbols: 13,
+    repairSymbols: 3,
+  });
   const fragment = encoder.nextFragment();
   assert.equal(qrModulesForFragment(fragment, 'low', 10), 57);
 });

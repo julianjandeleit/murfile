@@ -90,8 +90,30 @@ Available options:
 - `--max-fragment-length <bytes>`: fragment payload size; default 100.
 - `--size <pixels>`: QR PNG side length; default 512.
 - `--correction low|medium|quartile|high`: QR error correction; default `medium`.
-- `--format both|png|ur`: export both PNG and text, only PNG, or only UR text.
+- `--fountain-scope global|page|both`: use one global Fountain session (`global`, default), independent sessions per grid page (`page`), or export both variants (`both`; the latter two require `--grid`).
 - `--force`: permit writing into a non-empty output directory.
+
+`--grid` controls the visual arrangement of QR codes independently of the Fountain scope. With `global`, frames on different grid pages belong to the same MUR session. With `page`, each grid page is independently decodable and includes its own repair frames; `--frames` is not supported because the grid capacity determines the number of frames per page.
+
+With `--fountain-scope both`, murfile creates two separate output directories, `global/` and `page/`, each with its own manifest and UR fragments. Decode them separately:
+
+```bash
+murfile decode ./song-both/global --out ./recovered-global.mp3
+murfile decode ./song-both/page --out ./recovered-page.mp3
+```
+
+Examples:
+
+```bash
+# One global Fountain session, visually arranged as 3x3 pages
+murfile encode ./song.mp3 --out ./song-global --grid 3x3 --fountain-scope global
+
+# Independent Fountain session for every 3x3 page
+murfile encode ./song.mp3 --out ./song-pages --grid 3x3 --fountain-scope page
+
+# Export both encodings in separate subdirectories
+murfile encode ./song.mp3 --out ./song-both --grid 3x3 --fountain-scope both
+```
 
 ### Decode UR text files
 

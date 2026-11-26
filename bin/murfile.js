@@ -30,6 +30,7 @@ Encode options:
   --max-fragment-length <bytes>   Maximum MUR fragment payload (default: largest QR-fitting size)
   --qr-version <version>           Force QR matrix version 1-40 (default: automatic)
   --grid <columns>x<rows>          Arrange QR codes on PNG pages, e.g. 3x3
+  --fountain-scope <scope>         global|page|both (default: global; page and both require --grid)
   --grid-gap <pixels>              Gap between QR codes (default: 24; requires --grid)
   --grid-padding <pixels>          Outer grid margin (default: 48; requires --grid)
   --size <pixels>                 QR image width/height (default: 512)
@@ -65,7 +66,7 @@ function parseArgs(argv) {
   const positionals = [];
   const options = {};
   const valueOptions = new Set([
-    '--out', '-o', '--frames', '--max-fragment-length', '--qr-version', '--grid', '--grid-gap', '--grid-padding', '--size', '--correction', '--format',
+    '--out', '-o', '--frames', '--max-fragment-length', '--qr-version', '--grid', '--fountain-scope', '--grid-gap', '--grid-padding', '--size', '--correction', '--format',
   ]);
   const aliases = { '-o': '--out' };
 
@@ -326,6 +327,13 @@ async function encodeCommand(inputPath, options) {
     throw new Error('--qr-version must be between 1 and 40.');
   }
   const grid = options.grid === undefined ? undefined : parseGrid(options.grid);
+  const fountainScope = options.fountain_scope ?? 'global';
+  if (!['global', 'page', 'both'].includes(fountainScope)) {
+    throw new Error('--fountain-scope must be global, page or both.');
+  }
+  if ((fountainScope === 'page' || fountainScope === 'both') && grid === undefined) {
+    throw new Error(`--fountain-scope ${fountainScope} requires --grid.`);
+  }
   const gridGap = options.grid_gap === undefined
     ? 24
     : nonNegativeInteger(options.grid_gap, '--grid-gap');
@@ -350,8 +358,8 @@ async function encodeCommand(inputPath, options) {
   if (grid !== undefined && format === 'ur') {
     throw new Error('--grid requires --format png or both.');
   }
-  if (grid !== undefined && requestedFrameCount !== undefined) {
-    throw new Error('--frames cannot be used with --grid; page sessions use the grid capacity as their frame count.');
+  if ((fountainScope === 'page' || fountainScope === 'both') && requestedFrameCount !== undefined) {
+    throw new Error(`--frames cannot be used with --fountain-scope ${fountainScope}; page sessions use the grid capacity as their frame count.`);
   }
 
   const input = await readFile(inputPath);
@@ -372,8 +380,75 @@ async function encodeCommand(inputPath, options) {
   if (existing.length > 0 && !options.force) {
     throw new Error(`Output directory is not empty: ${outputDirectory} (use --force to overwrite files).`);
   }
-  // A grid export is one independent Fountain session per printed page.
-  if (grid) {
+  if (fountainScope === 'both') {
+    const framesPerPage = grid.columns * grid.rows;
+    if (framesPerPage < 3) {
+      throw new Error('--grid needs at least 3 cells so each page can contain data and repair fragments.');
+    }
+    const repairFramesPerPage = Math.max(1, Math.round(framesPerPage / 3));
+    if (framesPerPage - repairFramesPerPage < 2) {
+      throw new Error('--grid must leave at least two data frames per page.');
+    }
+
+    const globalDirectory = join(outputDirectory, 'global');
+    const pageDirectory = join(outputDirectory, 'page');
+
+    await encodeCommand(inputPath, {
+      ...options,
+      out: globalDirectory,
+      fountain_scope: 'global',
+    });
+    await encodeCommand(inputPath, {
+      ...options,
+      out: pageDirectory,
+      fountain_scope: 'page',
+    });
+
+    const globalManifest = JSON.parse(await readFile(join(globalDirectory, 'manifest.json'), 'utf8'));
+    const pageManifest = JSON.parse(await readFile(join(pageDirectory, 'manifest.json'), 'utf8'));
+    const manifest = {
+      format: 'MUR-BOTH',
+      fountainScope: 'both',
+      urType: 'bytes',
+      originalFilename: basename(inputPath),
+      originalSize: input.byteLength,
+      sha256: sha256(inputBytes),
+      grid: {
+        columns: grid.columns,
+        rows: grid.rows,
+      },
+      transfers: {
+        global: {
+          directory: 'global',
+          format: globalManifest.format,
+          frameCount: globalManifest.frameCount,
+          sourcePartCount: globalManifest.sourcePartCount,
+          pageCount: globalManifest.grid?.pageCount ?? null,
+        },
+        page: {
+          directory: 'page',
+          format: pageManifest.format,
+          frameCount: pageManifest.frameCount,
+          sourcePartCount: pageManifest.sourcePartCount,
+          pageCount: pageManifest.grid.pageCount,
+          dataFramesPerPage: pageManifest.grid.dataFramesPerPage,
+          repairFramesPerPage: pageManifest.grid.repairFramesPerPage,
+        },
+      },
+      generatedBy: `murfile/${VERSION}`,
+      protocol: 'Blockchain Commons BCR-2020-005 + BCR-2024-001',
+    };
+    await writeFile(join(outputDirectory, 'manifest.json'), `${JSON.stringify(manifest, null, 2)}\n`, 'utf8');
+
+    console.log(`Encoded both Fountain scopes: ${inputPath}`);
+    console.log(`Global transfer: ${globalManifest.frameCount} frames in ${globalManifest.grid.pageCount} visual pages`);
+    console.log(`Page transfer:  ${pageManifest.frameCount} frames in ${pageManifest.grid.pageCount} independent sessions`);
+    console.log(`Output:         ${outputDirectory}`);
+    return;
+  }
+
+  // Page scope creates one independent Fountain session per printed page.
+  if (grid && fountainScope === 'page') {
     const framesPerPage = grid.columns * grid.rows;
     if (framesPerPage < 3) {
       throw new Error('--grid needs at least 3 cells so each page can contain data and repair fragments.');
@@ -454,7 +529,7 @@ async function encodeCommand(inputPath, options) {
     const actualQrVersion = (firstQrModules - 17) / 4;
     const manifest = {
       format: 'MUR-PAGES',
-      fountainScope: 'page',
+      fountainScope,
       urType: 'bytes',
       originalFilename: basename(inputPath),
       originalSize: input.byteLength,
@@ -475,7 +550,7 @@ async function encodeCommand(inputPath, options) {
         dataFramesPerPage,
         repairFramesPerPage,
         ordering: 'row-major',
-        fountainScope: 'page',
+        fountainScope,
       },
       generatedBy: `murfile/${VERSION}`,
       protocol: 'Blockchain Commons BCR-2020-005 + BCR-2024-001',
@@ -568,6 +643,7 @@ async function encodeCommand(inputPath, options) {
 
   const manifest = {
     format: encoder.isSinglePart ? 'UR' : 'MUR',
+    fountainScope,
     urType: 'bytes',
     originalFilename: basename(inputPath),
     originalSize: input.byteLength,
@@ -589,6 +665,7 @@ async function encodeCommand(inputPath, options) {
       framesPerPage,
       pageCount,
       ordering: 'row-major',
+      fountainScope,
     } : null,
     generatedBy: `murfile/${VERSION}`,
     protocol: 'Blockchain Commons BCR-2020-005 + BCR-2024-001',
@@ -603,6 +680,7 @@ async function encodeCommand(inputPath, options) {
   console.log(`Format:  ${format}`);
   console.log(`QR:      version ${actualQrVersion} (${firstQrModules} modules)`);
   if (grid) console.log(`Grid:    ${grid.columns}x${grid.rows}, ${pageCount} pages, ${gridGap}px gap, ${gridPadding}px padding`);
+  console.log(`Fountain scope: ${fountainScope}`);
   if (!encoder.isSinglePart) console.log(`Source fragments: ${encoder.sourcePartCount}; exported fragments include fountain redundancy.`);
 }
 

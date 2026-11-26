@@ -122,6 +122,46 @@ test('CLI forces every emitted QR to the requested matrix version', async () => 
   }
 });
 
+test('CLI keeps one global fountain session when exporting a grid', async () => {
+  const directory = await mkdtemp(join(tmpdir(), 'murfile-global-grid-'));
+  try {
+    const sourcePath = join(directory, 'sample.bin');
+    const framesDirectory = join(directory, 'frames');
+    const outputPath = join(directory, 'recovered.bin');
+    const original = randomBytes(4000);
+    await writeFile(sourcePath, original);
+
+    const encoded = runCli([
+      'encode', sourcePath,
+      '--out', framesDirectory,
+      '--max-fragment-length', '100',
+      '--size', '128',
+      '--grid', '2x2',
+      '--format', 'both',
+    ]);
+    assert.equal(encoded.status, 0, encoded.stderr || encoded.stdout);
+
+    const manifest = JSON.parse(await readFile(join(framesDirectory, 'manifest.json'), 'utf8'));
+    assert.equal(manifest.fountainScope, 'global');
+    assert.equal(manifest.grid.fountainScope, 'global');
+    assert.ok(manifest.frameCount > manifest.sourcePartCount);
+    assert.equal(manifest.grid.pageCount, Math.ceil(manifest.frameCount / 4));
+
+    const files = await readdir(framesDirectory);
+    const pageFiles = files.filter((file) => /^page-\d+\.png$/.test(file));
+    const urFiles = files.filter((file) => /^frame-\d+\.ur\.txt$/.test(file));
+    assert.equal(pageFiles.length, manifest.grid.pageCount);
+    assert.equal(urFiles.length, manifest.frameCount);
+    assert.equal(files.some((file) => /^page-\d+-frame-\d+\.ur\.txt$/.test(file)), false);
+
+    const decoded = runCli(['decode', framesDirectory, '--out', outputPath]);
+    assert.equal(decoded.status, 0, decoded.stderr || decoded.stdout);
+    assert.equal(hash(await readFile(outputPath)), hash(original));
+  } finally {
+    await rm(directory, { recursive: true, force: true });
+  }
+});
+
 test('CLI exports QR frames as row-major grid PNG pages', async () => {
   const directory = await mkdtemp(join(tmpdir(), 'murfile-grid-'));
   try {
@@ -144,6 +184,7 @@ test('CLI exports QR frames as row-major grid PNG pages', async () => {
       '--max-fragment-length', '100',
       '--size', String(size),
       '--grid', `${columns}x${rows}`,
+      '--fountain-scope', 'page',
       '--grid-gap', String(gap),
       '--grid-padding', String(padding),
       '--format', 'both',
@@ -188,6 +229,73 @@ test('CLI exports QR frames as row-major grid PNG pages', async () => {
     await rm(directory, { recursive: true, force: true });
   }
 });
+
+test('CLI exports both global and page-scoped fountain transfers', async () => {
+  const directory = await mkdtemp(join(tmpdir(), 'murfile-both-scopes-'));
+  try {
+    const sourcePath = join(directory, 'sample.bin');
+    const framesDirectory = join(directory, 'frames');
+    const globalOutputPath = join(directory, 'recovered-global.bin');
+    const pageOutputPath = join(directory, 'recovered-page.bin');
+    const original = randomBytes(4000);
+    await writeFile(sourcePath, original);
+
+    const encoded = runCli([
+      'encode', sourcePath,
+      '--out', framesDirectory,
+      '--max-fragment-length', '100',
+      '--size', '128',
+      '--grid', '2x2',
+      '--fountain-scope', 'both',
+      '--format', 'both',
+    ]);
+    assert.equal(encoded.status, 0, encoded.stderr || encoded.stdout);
+
+    const manifest = JSON.parse(await readFile(join(framesDirectory, 'manifest.json'), 'utf8'));
+    assert.equal(manifest.format, 'MUR-BOTH');
+    assert.equal(manifest.fountainScope, 'both');
+    assert.equal(manifest.transfers.global.directory, 'global');
+    assert.equal(manifest.transfers.page.directory, 'page');
+
+    const globalDirectory = join(framesDirectory, 'global');
+    const pageDirectory = join(framesDirectory, 'page');
+    const globalManifest = JSON.parse(await readFile(join(globalDirectory, 'manifest.json'), 'utf8'));
+    const pageManifest = JSON.parse(await readFile(join(pageDirectory, 'manifest.json'), 'utf8'));
+    assert.equal(globalManifest.fountainScope, 'global');
+    assert.equal(pageManifest.fountainScope, 'page');
+
+    const globalDecoded = runCli(['decode', globalDirectory, '--out', globalOutputPath]);
+    assert.equal(globalDecoded.status, 0, globalDecoded.stderr || globalDecoded.stdout);
+    assert.equal(hash(await readFile(globalOutputPath)), hash(original));
+
+    const pageDecoded = runCli(['decode', pageDirectory, '--out', pageOutputPath]);
+    assert.equal(pageDecoded.status, 0, pageDecoded.stderr || pageDecoded.stdout);
+    assert.equal(hash(await readFile(pageOutputPath)), hash(original));
+  } finally {
+    await rm(directory, { recursive: true, force: true });
+  }
+});
+
+test('CLI requires a grid when both fountain scopes are selected', () => {
+  const encoded = runCli([
+    'encode', 'unused.bin',
+    '--out', '/tmp/murfile-both-scope-without-grid',
+    '--fountain-scope', 'both',
+  ]);
+  assert.notEqual(encoded.status, 0);
+  assert.match(encoded.stderr, /--fountain-scope both requires --grid/);
+});
+
+test('CLI requires a grid when page fountain scope is selected', () => {
+  const encoded = runCli([
+    'encode', 'unused.bin',
+    '--out', '/tmp/murfile-page-scope-without-grid',
+    '--fountain-scope', 'page',
+  ]);
+  assert.notEqual(encoded.status, 0);
+  assert.match(encoded.stderr, /--fountain-scope page requires --grid/);
+});
+
 
 test('CLI inspect emits JSON status', async () => {
   const directory = await mkdtemp(join(tmpdir(), 'murfile-inspect-'));

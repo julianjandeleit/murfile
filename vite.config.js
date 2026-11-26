@@ -6,7 +6,11 @@ const projectRoot = dirname(fileURLToPath(import.meta.url));
 
 export default defineConfig({
   root: resolve(projectRoot, 'web'),
-  base: '/murfile/',
+  base: '/murfile/murfile/',
+  build: {
+    outDir: resolve(projectRoot, 'dist/murfile'),
+    emptyOutDir: true,
+  },
   resolve: {
     // ZBar's inlined build avoids fetching a separate .wasm file at runtime.
     conditions: ['zbar-inlined', 'module', 'browser'],

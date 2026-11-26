@@ -52,6 +52,8 @@ if (decoder.complete) {
 
 `FileDecoder` routes multipart fragments to the official `MultipartDecoder` and single-part URs to `UR.parse()`. It exposes the official fountain decoder's `progress` value (0–1), as well as received, duplicate, redundant and invalid counters.
 
+The shared QR/grid functions are available from the `murfile/qr-grid` package subpath, separately from the Murfile CLI and browser application.
+
 Each `FileDecoder` instance represents **one transfer**. Do not mix fragments from different transfers in one session. MUR does not add a per-file UUID to the standard part strings, so two concurrent transfers of the same UR type must be decoded in separate sessions.
 
 ## CLI
@@ -138,6 +140,33 @@ murfile inspect ./song-qr --json
 
 `inspect` reports the number of UR strings, fountain progress, accepted fragments, duplicates, redundant fragments and invalid URs.
 
+### Page-scoped Fountain redundancy
+
+Murfile preserves its existing page-repair ratio by default. For page-scoped exports, `--page-redundancy low` instead reserves one quarter of each grid's cells for Fountain repair fragments:
+
+```bash
+murfile encode ./recording.mp3 --out ./pages \
+  --grid 4x4 --fountain-scope page --page-redundancy low
+```
+
+For a 4x4 grid this is 12 source and 4 repair frames per page. The option applies only to page-scoped (or `both`) output; global Fountain exports retain their existing frame-count behavior.
+
+## Soundbook
+
+The separate Soundbook CLI transcodes one complete recording to Ogg Opus and divides the compressed bytes into independent page-scoped Fountain sessions. Audio segmentation is not enabled yet, so playback and download become available only after every page is reconstructed and the whole-book SHA-256 validates.
+
+```bash
+npm run cli:soundbook -- encode ./recording.wav --out ./recording-book
+npm run dev:soundbook
+npm run build:soundbook
+```
+
+FFmpeg and ffprobe must be installed and available on `PATH`. Defaults are a 48 kb/s, 48 kHz stereo Ogg Opus transcode, 4x4 grid, QR version 20, QR error correction L, and minimal Fountain redundancy (1 repair cell per 16-cell page). Use `--fountain-redundancy low` for 4 repair cells or `default` for 5. The reader is served from its own Vite root and can be deployed separately from Murfile.
+
+Minimal Fountain redundancy increases the data allocation from 12 to 15 QR cells per grid. The exact compressed-audio payload depends on the chosen redundancy profile; the UR/Bytewords text and Fountain framing reduce usable capacity. `--qr-version 28` provides additional capacity, but version 20 remains the default. Printed-module size and camera performance still require physical-device validation.
+
+The reader reports completed/missing pages and active Fountain sessions, waits rather than skipping a missing page, and enables playback plus an optional `.ogg` download only after the complete file is reconstructed. The whole compressed recording is one stream at this stage; later audio-segment support is required for playback to begin before all pages arrive.
+
 ## Live web reader
 
 Start the local development server:
@@ -193,6 +222,8 @@ The Node test suite covers:
 - duplicate and malformed input handling;
 - rejection of other UR types;
 - CLI encode/decode roundtrip using text sidecars;
+- shared QR/grid API behavior and fixed-version rendering;
+- Soundbook envelope validation, interleaved page reconstruction, integrity checks, and FFmpeg CLI roundtrip;
 - a 2.1 MB roundtrip matching the intended file-size range.
 
 These tests run against the installed Blockchain Commons TypeScript package. They do not replace differential interoperability tests against the Rust/Swift/C++ reference implementations, printed-page tests, or physical-device camera validation.
@@ -201,10 +232,14 @@ These tests run against the installed Blockchain Commons TypeScript package. The
 
 ```bash
 npm run build
+npm run build:soundbook
+npm run build:site
 npm run preview
 ```
 
-The production web assets are written to `dist/`.
+`npm run build:site` creates one GitHub Pages-ready `dist/` directory: the landing page is at its root, Murfile at `dist/murfile/`, and Soundbook at `dist/soundbook/`. On the `julianjandeleit.github.io/murfile` project site these are served at `/murfile/`, `/murfile/murfile/`, and `/murfile/soundbook/`, respectively. The reader headers link between the two decoder paths.
+
+Individual app builds write to their respective subdirectories in `dist/`.
 
 ## Architecture
 

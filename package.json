@@ -9,20 +9,28 @@
     "node": ">=22.12.0"
   },
   "bin": {
-    "murfile": "./bin/murfile.js"
+    "murfile": "./bin/murfile.js",
+    "soundbook": "./bin/soundbook.js"
   },
   "exports": {
     ".": "./src/index.js",
     "./encoder": "./src/encoder.js",
-    "./decoder": "./src/decoder.js"
+    "./decoder": "./src/decoder.js",
+    "./qr-grid": "./src/qr-grid.js",
+    "./soundbook": "./src/soundbook.js",
+    "./soundbook/encoder": "./src/soundbook-encoder.js"
   },
   "scripts": {
     "test": "node --test",
     "test:watch": "node --test --watch",
     "dev": "vite --config vite.config.js",
+    "dev:soundbook": "vite --config soundbook/vite.config.js",
     "build": "vite build --config vite.config.js",
+    "build:soundbook": "vite build --config soundbook/vite.config.js",
+    "build:site": "npm run build && npm run build:soundbook && node scripts/write-site-index.js",
     "preview": "vite preview --config vite.config.js",
     "cli": "node ./bin/murfile.js",
+    "cli:soundbook": "node ./bin/soundbook.js",
     "build:qr-fixed": "node ./scripts/build-fixed-qr.js"
   },
   "dependencies": {

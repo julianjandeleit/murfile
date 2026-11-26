@@ -1,4 +1,5 @@
 import { FileDecoder } from '../../src/index.js';
+import { populateCameraSelect, requestCameraStream } from '../../src/browser/camera.js';
 import './style.css';
 
 const $ = (id) => document.getElementById(id);
@@ -131,56 +132,6 @@ function resetSession() {
   renderCounters();
 }
 
-function isSecureCameraContext() {
-  return window.isSecureContext || location.hostname === 'localhost' || location.hostname === '127.0.0.1';
-}
-
-async function listCameras() {
-  if (!navigator.mediaDevices?.enumerateDevices) return;
-  const devices = await navigator.mediaDevices.enumerateDevices();
-  const cameras = devices.filter((device) => device.kind === 'videoinput');
-  const oldValue = selectedCameraId || elements.cameraSelect.value;
-  elements.cameraSelect.replaceChildren();
-  cameras.forEach((camera, index) => {
-    const option = document.createElement('option');
-    option.value = camera.deviceId;
-    option.textContent = camera.label || `Kamera ${index + 1}`;
-    elements.cameraSelect.append(option);
-  });
-  if (oldValue && cameras.some((camera) => camera.deviceId === oldValue)) {
-    elements.cameraSelect.value = oldValue;
-  } else if (cameras.length) {
-    const rear = cameras.find((camera) => /back|rear|environment|rück|hinten/i.test(camera.label));
-    elements.cameraSelect.value = (rear || cameras[0]).deviceId;
-  }
-  selectedCameraId = elements.cameraSelect.value;
-  elements.cameraSelect.disabled = cameras.length < 2;
-}
-
-async function requestCamera() {
-  if (!navigator.mediaDevices?.getUserMedia) {
-    throw new Error('Dieser Browser stellt keinen Kamerazugriff über getUserMedia bereit.');
-  }
-  if (!isSecureCameraContext()) {
-    throw new Error('Der Kamerazugriff benötigt HTTPS oder localhost.');
-  }
-
-  const constraints = selectedCameraId
-    ? { deviceId: { exact: selectedCameraId }, width: { ideal: 1920 }, height: { ideal: 1080 }, frameRate: { ideal: 24, max: 30 } }
-    : { facingMode: { ideal: 'environment' }, width: { ideal: 1920 }, height: { ideal: 1080 }, frameRate: { ideal: 24, max: 30 } };
-
-  try {
-    return await navigator.mediaDevices.getUserMedia({ audio: false, video: constraints });
-  } catch (firstError) {
-    try {
-      const fallback = selectedCameraId ? { deviceId: { exact: selectedCameraId } } : { facingMode: 'environment' };
-      return await navigator.mediaDevices.getUserMedia({ audio: false, video: fallback });
-    } catch {
-      throw firstError;
-    }
-  }
-}
-
 function updateTorchAvailability() {
   const track = mediaStream?.getVideoTracks?.()[0];
   let supportsTorch = false;
@@ -230,7 +181,10 @@ async function startCamera() {
   elements.startButton.disabled = true;
   setCameraState('Verbinde …', 'starting');
   try {
-    mediaStream = await requestCamera();
+    mediaStream = await requestCameraStream(selectedCameraId, {
+      unavailableMessage: 'Dieser Browser stellt keinen Kamerazugriff über getUserMedia bereit.',
+      insecureMessage: 'Der Kamerazugriff benötigt HTTPS oder localhost.',
+    });
     elements.video.srcObject = mediaStream;
     await elements.video.play();
     elements.videoPlaceholder.hidden = true;
@@ -241,7 +195,9 @@ async function startCamera() {
     elements.resolutionLabel.textContent = `${trackSettings.width || elements.video.videoWidth} × ${trackSettings.height || elements.video.videoHeight}`;
     setCameraState('Live', 'live');
     updateTorchAvailability();
-    await listCameras();
+    selectedCameraId = await populateCameraSelect(elements.cameraSelect, selectedCameraId, {
+      cameraLabel: 'Kamera',
+    });
     addEvent('Kamera gestartet.', 'normal');
     lastFrameAt = 0;
     animationFrameId = requestAnimationFrame(scanLoop);

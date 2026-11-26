@@ -276,6 +276,34 @@ test('CLI exports both global and page-scoped fountain transfers', async () => {
   }
 });
 
+test('CLI page redundancy profile low reserves one quarter of grid cells for repair', async () => {
+  const directory = await mkdtemp(join(tmpdir(), 'murfile-low-redundancy-'));
+  try {
+    const sourcePath = join(directory, 'sample.bin');
+    const framesDirectory = join(directory, 'frames');
+    await writeFile(sourcePath, randomBytes(1200));
+
+    const encoded = runCli([
+      'encode', sourcePath,
+      '--out', framesDirectory,
+      '--grid', '4x4',
+      '--fountain-scope', 'page',
+      '--page-redundancy', 'low',
+      '--qr-version', '20',
+      '--size', '128',
+      '--format', 'png',
+    ]);
+    assert.equal(encoded.status, 0, encoded.stderr || encoded.stdout);
+
+    const manifest = JSON.parse(await readFile(join(framesDirectory, 'manifest.json'), 'utf8'));
+    assert.equal(manifest.pageRedundancy, 'low');
+    assert.equal(manifest.grid.repairFramesPerPage, 4);
+    assert.equal(manifest.grid.dataFramesPerPage, 12);
+  } finally {
+    await rm(directory, { recursive: true, force: true });
+  }
+});
+
 test('CLI requires a grid when both fountain scopes are selected', () => {
   const encoded = runCli([
     'encode', 'unused.bin',

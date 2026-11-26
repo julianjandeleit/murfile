@@ -1,4 +1,4 @@
-export const DEFAULT_SCAN_WIDTH = 1440;
+export const DEFAULT_SCAN_WIDTH = 2560;
 export const HIGH_RESOLUTION_PROBE_INTERVAL = 8;
 
 export class AdaptiveScanResolution {
@@ -46,10 +46,7 @@ export class AdaptiveScanResolution {
 
     const bestLowResolutionCount = Math.max(0, ...this.recentLowResolutionSymbolCounts);
     if (symbolCount > bestLowResolutionCount) {
-      this.scanWidth = Math.min(
-        sourceWidth,
-        Math.ceil(this.scanWidth * 1.5),
-      );
+      this.scanWidth = sourceWidth;
     }
     this.recentLowResolutionSymbolCounts = [];
   }

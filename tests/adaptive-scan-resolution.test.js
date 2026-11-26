@@ -38,7 +38,7 @@ test('probes at full resolution periodically without raising the scan width unne
   assert.equal(adaptive.next(3840).width, DEFAULT_SCAN_WIDTH);
 });
 
-test('raises the regular scan width when a full-resolution probe finds more symbols', () => {
+test('switches to full-resolution scans when a probe finds more symbols', () => {
   const adaptive = new AdaptiveScanResolution();
 
   for (let index = 0; index < HIGH_RESOLUTION_PROBE_INTERVAL - 1; index += 1) {
@@ -56,7 +56,7 @@ test('raises the regular scan width when a full-resolution probe finds more symb
     symbolCount: 3,
   });
 
-  assert.equal(adaptive.next(3840).width, Math.ceil(DEFAULT_SCAN_WIDTH * 1.5));
+  assert.equal(adaptive.next(3840).width, 3840);
 });
 
 test('uses the full frame directly when the camera source is already small', () => {
@@ -84,7 +84,7 @@ test('resets the learned resolution when a new camera session starts', () => {
     isHighResolutionProbe: probe.isHighResolutionProbe,
     symbolCount: 2,
   });
-  assert.equal(adaptive.next(3840).width, Math.ceil(DEFAULT_SCAN_WIDTH * 1.5));
+  assert.equal(adaptive.next(3840).width, 3840);
 
   adaptive.reset();
 

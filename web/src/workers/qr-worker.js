@@ -1,4 +1,4 @@
-import { scanImageData } from '@undecaf/zbar-wasm';
+import { scanImageDataWithoutCache } from '../../../src/browser/zbar-scanner.js';
 
 self.addEventListener('message', async (event) => {
   const message = event.data;
@@ -7,7 +7,7 @@ self.addEventListener('message', async (event) => {
   try {
     const { width, height, pixels, frameId } = message;
     const imageData = new ImageData(new Uint8ClampedArray(pixels), width, height);
-    const symbols = await scanImageData(imageData);
+    const symbols = await scanImageDataWithoutCache(imageData);
     const qrSymbols = symbols.filter((symbol) => /qr/i.test(symbol.typeName || ''));
     const texts = [];
 

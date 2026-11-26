@@ -1,5 +1,6 @@
 import { FileDecoder } from '../../src/index.js';
 import { populateCameraSelect, requestCameraStream } from '../../src/browser/camera.js';
+import { AdaptiveScanResolution } from '../../src/browser/adaptive-scan-resolution.js';
 import './style.css';
 
 const $ = (id) => document.getElementById(id);
@@ -36,6 +37,7 @@ const elements = {
 };
 
 const session = new FileDecoder();
+const adaptiveScanResolution = new AdaptiveScanResolution();
 const canvas = document.createElement('canvas');
 const canvasContext = canvas.getContext('2d', { willReadFrequently: true });
 const qrWorker = new Worker(new URL('./workers/qr-worker.js', import.meta.url), { type: 'module' });
@@ -185,6 +187,7 @@ async function startCamera() {
       insecureMessage: 'Der Kamerazugriff benötigt HTTPS oder localhost.',
     });
     mediaStream = camera.stream;
+    adaptiveScanResolution.reset();
     elements.video.srcObject = mediaStream;
     await elements.video.play();
     elements.videoPlaceholder.hidden = true;
@@ -221,8 +224,9 @@ function submitFrame(timestamp) {
   const sourceHeight = elements.video.videoHeight;
   if (!sourceWidth || !sourceHeight) return;
 
-  const width = sourceWidth;
-  const height = sourceHeight;
+  const scan = adaptiveScanResolution.next(sourceWidth);
+  const width = scan.width;
+  const height = Math.max(1, Math.round(sourceHeight * width / sourceWidth));
   if (canvas.width !== width || canvas.height !== height) {
     canvas.width = width;
     canvas.height = height;
@@ -232,7 +236,15 @@ function submitFrame(timestamp) {
   const imageData = canvasContext.getImageData(0, 0, width, height);
   workerBusy = true;
   frameId += 1;
-  qrWorker.postMessage({ type: 'scan-frame', frameId, width, height, pixels: imageData.data.buffer }, [imageData.data.buffer]);
+  qrWorker.postMessage({
+    type: 'scan-frame',
+    frameId,
+    width,
+    height,
+    sourceWidth,
+    isHighResolutionProbe: scan.isHighResolutionProbe,
+    pixels: imageData.data.buffer,
+  }, [imageData.data.buffer]);
   framesInWindow += 1;
   if (!lastRateUpdate) lastRateUpdate = timestamp;
   if (timestamp - lastRateUpdate >= 1000) {
@@ -319,6 +331,11 @@ qrWorker.addEventListener('message', (event) => {
   const message = event.data;
   workerBusy = false;
   if (message?.type === 'scan-result') {
+    adaptiveScanResolution.observe({
+      sourceWidth: message.sourceWidth,
+      isHighResolutionProbe: message.isHighResolutionProbe,
+      symbolCount: message.totalSymbols,
+    });
     handleQrTexts(message.texts || []);
   } else if (message?.type === 'scan-error') {
     addEvent(`QR-Erkennung: ${message.message}`, 'warning');

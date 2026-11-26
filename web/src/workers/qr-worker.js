@@ -20,11 +20,20 @@ self.addEventListener('message', async (event) => {
       }
     }
 
-    self.postMessage({ type: 'scan-result', frameId, totalSymbols: qrSymbols.length, texts });
+    self.postMessage({
+      type: 'scan-result',
+      frameId,
+      sourceWidth: message.sourceWidth,
+      isHighResolutionProbe: message.isHighResolutionProbe,
+      totalSymbols: qrSymbols.length,
+      texts,
+    });
   } catch (error) {
     self.postMessage({
       type: 'scan-error',
       frameId: message.frameId,
+      sourceWidth: message.sourceWidth,
+      isHighResolutionProbe: message.isHighResolutionProbe,
       message: error instanceof Error ? error.message : String(error),
     });
   }

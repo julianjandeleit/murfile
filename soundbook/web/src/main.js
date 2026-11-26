@@ -1,6 +1,7 @@
 import { SoundbookDecoder } from '../../../src/soundbook-decoder.js';
 import { completeOggPrefixLength } from '../../../src/ogg-stream.js';
 import { populateCameraSelect, requestCameraStream } from '../../../src/browser/camera.js';
+import { AdaptiveScanResolution } from '../../../src/browser/adaptive-scan-resolution.js';
 import './style.css';
 
 const $ = (id) => document.getElementById(id);
@@ -29,6 +30,7 @@ const elements = {
 };
 
 const decoder = new SoundbookDecoder();
+const adaptiveScanResolution = new AdaptiveScanResolution();
 const supportsOggOpus = Boolean(
   document.createElement('audio').canPlayType('audio/ogg; codecs="opus"'),
 );
@@ -380,6 +382,7 @@ function renderStatus() {
 async function startCamera() {
   const camera = await requestCameraStream(selectedCameraId);
   mediaStream = camera.stream;
+  adaptiveScanResolution.reset();
   elements.video.srcObject = mediaStream;
   await elements.video.play();
   elements.videoPlaceholder.hidden = true;
@@ -421,8 +424,9 @@ function submitFrame() {
   const sourceWidth = elements.video.videoWidth;
   const sourceHeight = elements.video.videoHeight;
   if (!sourceWidth || !sourceHeight) return;
-  const width = sourceWidth;
-  const height = sourceHeight;
+  const scan = adaptiveScanResolution.next(sourceWidth);
+  const width = scan.width;
+  const height = Math.max(1, Math.round(sourceHeight * width / sourceWidth));
   if (canvas.width !== width || canvas.height !== height) {
     canvas.width = width;
     canvas.height = height;
@@ -436,6 +440,8 @@ function submitFrame() {
     frameId,
     width,
     height,
+    sourceWidth,
+    isHighResolutionProbe: scan.isHighResolutionProbe,
     pixels: imageData.data.buffer,
   }, [imageData.data.buffer]);
 }
@@ -479,6 +485,11 @@ async function handleQrTexts(texts) {
 qrWorker.addEventListener('message', (event) => {
   workerBusy = false;
   if (event.data?.type === 'scan-result') {
+    adaptiveScanResolution.observe({
+      sourceWidth: event.data.sourceWidth,
+      isHighResolutionProbe: event.data.isHighResolutionProbe,
+      symbolCount: event.data.totalSymbols,
+    });
     void handleQrTexts(event.data.texts || []).catch((error) => {
       elements.statusTitle.textContent = 'Soundbook processing failed';
       elements.statusDetail.textContent = error.message;

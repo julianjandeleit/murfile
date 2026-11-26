@@ -3,21 +3,18 @@ import { createHash, randomBytes } from 'node:crypto';
 import { mkdir, readFile, readdir, writeFile } from 'node:fs/promises';
 import { basename, join, resolve } from 'node:path';
 import { spawnSync } from 'node:child_process';
-import { tmpdir } from 'node:os';
-import { mkdtemp, rm } from 'node:fs/promises';
 import {
   createSoundbookPagePlan,
   encodeSoundbookPage,
 } from '../src/soundbook-encoder.js';
+import { completeOggPrefixLength, isOggOpus } from '../src/ogg-stream.js';
 
 const VERSION = '0.1.0';
 
 function usage() {
   return `soundbook ${VERSION}
 
-Encode one complete audio recording as independent Fountain-scoped QR grid pages.
-The audio remains one compressed Ogg Opus recording; page-level audio segmentation
-is not enabled yet.
+Encode an Ogg Opus file byte-for-byte into QR pages.
 
 Usage:
   soundbook encode <audio-file> --out <directory> [options]
@@ -28,9 +25,10 @@ Options:
   --qr-version <version>              QR version 1-40 (default: 20)
   --correction <level>                low|medium|quartile|high (default: low)
   --size <pixels>                     QR image side length (default: 512)
-  --fountain-redundancy <profile>     minimal|low|default (default: minimal)
-  --bitrate <rate>                    Ogg Opus bitrate (default: 48k)
+  --fountain-redundancy <profile>     minimal|low|default (max missing cells; default: minimal)
   --force                             Allow writing into a non-empty directory
+
+The input must be an Ogg Opus file. Its audio bytes are never transcoded or modified.
 `;
 }
 
@@ -43,7 +41,7 @@ function parseArgs(argv) {
   const options = {};
   const valued = new Set([
     '--out', '--grid', '--qr-version', '--correction', '--size',
-    '--fountain-redundancy', '--bitrate', '--grid-gap', '--grid-padding',
+    '--fountain-redundancy', '--grid-gap', '--grid-padding',
   ]);
   for (let index = 0; index < args.length; index += 1) {
     const arg = args[index];
@@ -93,23 +91,21 @@ function run(command, args) {
   return result.stdout.trim();
 }
 
-function transcodeToOggOpus(inputPath, outputPath, bitrate) {
-  run('ffmpeg', [
-    '-hide_banner', '-loglevel', 'error', '-y',
-    '-i', inputPath,
-    '-map', '0:a:0', '-vn',
-    '-ac', '2', '-ar', '48000',
-    '-c:a', 'libopus', '-b:a', bitrate, '-vbr', 'on', '-application', 'audio',
-    '-f', 'ogg', outputPath,
-  ]);
-  const duration = Number(run('ffprobe', [
+function probeOggOpus(inputPath) {
+  const probe = JSON.parse(run('ffprobe', [
     '-v', 'error',
-    '-show_entries', 'format=duration',
-    '-of', 'default=noprint_wrappers=1:nokey=1',
-    outputPath,
+    '-show_entries', 'format=format_name,duration:stream=codec_name',
+    '-of', 'json',
+    inputPath,
   ]));
+  const formatNames = String(probe.format?.format_name ?? '').split(',');
+  if (!formatNames.includes('ogg') ||
+      !probe.streams?.some((stream) => stream.codec_name === 'opus')) {
+    throw new Error('Soundbook requires an Ogg Opus input file; input bytes are preserved without transcoding.');
+  }
+  const duration = Number(probe.format?.duration);
   if (!Number.isFinite(duration) || duration <= 0) {
-    throw new Error('ffprobe did not report a valid duration for the compressed Ogg Opus recording.');
+    throw new Error('ffprobe did not report a valid duration for the input audio.');
   }
   return Math.round(duration * 1_000_000);
 }
@@ -128,8 +124,6 @@ async function encode(inputPath, options) {
   if (!['minimal', 'low', 'default'].includes(redundancy)) {
     throw new Error('--fountain-redundancy must be minimal, low or default.');
   }
-  const bitrate = options.bitrate ?? '48k';
-  if (!/^\d+k$/i.test(bitrate)) throw new Error('--bitrate must use the form 48k.');
   const gap = positiveInteger(options.grid_gap ?? '24', '--grid-gap');
   const padding = positiveInteger(options.grid_padding ?? '48', '--grid-padding');
   const inputPathResolved = resolve(inputPath);
@@ -140,54 +134,57 @@ async function encode(inputPath, options) {
     throw new Error(`Output directory is not empty: ${outputDirectory} (use --force to overwrite files).`);
   }
 
-  const temporaryDirectory = await mkdtemp(join(tmpdir(), 'soundbook-'));
-  try {
-    const compressedPath = join(temporaryDirectory, 'recording.ogg');
-    const durationMicros = transcodeToOggOpus(inputPathResolved, compressedPath, bitrate);
-    const audio = new Uint8Array(await readFile(compressedPath));
-    const audioSha256 = createHash('sha256').update(audio).digest('hex');
-    const bookId = randomBytes(16).toString('hex');
-    const plan = createSoundbookPagePlan(audio, {
-      bookId,
-      audioSha256,
-      durationMicros,
-      ...grid,
-      size,
-      correction,
-      qrVersion,
-      gap,
-      padding,
-      redundancy,
-    });
-
-    const pageDigits = String(plan.pageCount).length;
-    const frameDigits = String(plan.framesPerPage).length;
-    for (let pageIndex = 0; pageIndex < plan.pageCount; pageIndex += 1) {
-      const page = encodeSoundbookPage(audio, plan, pageIndex);
-      const pageStem = `page-${String(page.pageIndex + 1).padStart(pageDigits, '0')}`;
-      await writeFile(join(outputDirectory, `${pageStem}.png`), page.png);
-      for (let index = 0; index < page.fragments.length; index += 1) {
-        const frameStem = `${pageStem}-frame-${String(index + 1).padStart(frameDigits, '0')}`;
-        await writeFile(join(outputDirectory, `${frameStem}.ur.txt`), `${page.fragments[index]}\n`, 'utf8');
-      }
-    }
-
-    const manifest = {
-      ...plan.manifest,
-      originalFilename: basename(inputPathResolved),
-      audioFormat: 'Ogg Opus',
-      bitrate,
-      generatedAt: new Date().toISOString(),
-    };
-    await writeFile(join(outputDirectory, 'manifest.json'), `${JSON.stringify(manifest, null, 2)}\n`, 'utf8');
-    console.log(`Encoded: ${inputPathResolved}`);
-    console.log(`Audio:   ${(durationMicros / 1_000_000).toFixed(2)} s · ${audio.length} compressed bytes`);
-    console.log(`Pages:   ${manifest.pageCount} · ${manifest.grid.dataFramesPerPage} data + ${manifest.grid.repairFramesPerPage} repair frames/page`);
-    console.log(`Payload: ${manifest.pagePayloadBytes} compressed audio bytes/page`);
-    console.log(`Output:  ${outputDirectory}`);
-  } finally {
-    await rm(temporaryDirectory, { recursive: true, force: true });
+  const durationMicros = probeOggOpus(inputPathResolved);
+  const audio = new Uint8Array(await readFile(inputPathResolved));
+  if (!isOggOpus(audio) || completeOggPrefixLength(audio) !== audio.byteLength) {
+    throw new Error('Input is not a complete Ogg Opus byte stream.');
   }
+  const bookId = randomBytes(16).toString('hex');
+  const planOptions = {
+    bookId,
+    audioSha256: createHash('sha256').update(audio).digest('hex'),
+    durationMicros,
+    ...grid,
+    size,
+    correction,
+    qrVersion,
+    gap,
+    padding,
+    redundancy,
+  };
+  const sizingPlan = createSoundbookPagePlan(audio, planOptions);
+  const chunkHashes = Array.from({ length: sizingPlan.pageCount }, (_, pageIndex) => {
+    const offset = pageIndex * sizingPlan.chunkCapacity;
+    return createHash('sha256')
+      .update(audio.subarray(offset, Math.min(offset + sizingPlan.chunkCapacity, audio.byteLength)))
+      .digest('hex');
+  });
+  const plan = createSoundbookPagePlan(audio, { ...planOptions, chunkHashes });
+
+  const pageDigits = String(plan.pageCount).length;
+  const frameDigits = String(plan.framesPerPage).length;
+  for (let pageIndex = 0; pageIndex < plan.pageCount; pageIndex += 1) {
+    const page = encodeSoundbookPage(audio, plan, pageIndex);
+    const pageStem = `page-${String(page.pageIndex + 1).padStart(pageDigits, '0')}`;
+    await writeFile(join(outputDirectory, `${pageStem}.png`), page.png);
+    for (let index = 0; index < page.fragments.length; index += 1) {
+      const frameStem = `${pageStem}-frame-${String(index + 1).padStart(frameDigits, '0')}`;
+      await writeFile(join(outputDirectory, `${frameStem}.ur.txt`), `${page.fragments[index]}\n`, 'utf8');
+    }
+  }
+
+  const manifest = {
+    ...plan.manifest,
+    originalFilename: basename(inputPathResolved),
+    audioFormat: 'Original Ogg Opus bytes (unchanged)',
+    generatedAt: new Date().toISOString(),
+  };
+  await writeFile(join(outputDirectory, 'manifest.json'), `${JSON.stringify(manifest, null, 2)}\n`, 'utf8');
+  console.log(`Encoded: ${inputPathResolved}`);
+  console.log(`Audio:   ${(durationMicros / 1_000_000).toFixed(2)} s · ${audio.byteLength} original bytes`);
+  console.log(`Pages:   ${manifest.pageCount} · ${manifest.grid.framesPerPage} mixed symbols/page; recover up to ${manifest.grid.guaranteedErasures} missing`);
+  console.log(`Payload: ${manifest.pagePayloadBytes} original audio bytes/page`);
+  console.log(`Output:  ${outputDirectory}`);
 }
 
 async function main() {

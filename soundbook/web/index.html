@@ -47,7 +47,7 @@
               <button id="resetButton" class="text-button" type="button">Reset</button>
             </div>
             <p id="statusTitle" class="status-title">Waiting for Soundbook pages</p>
-            <p id="statusDetail" class="status-detail">Point the camera at any page. The full compressed recording becomes playable when every page is reconstructed.</p>
+            <p id="statusDetail" class="status-detail">Playback starts with the first recovered page and waits at missing pages.</p>
             <div class="metrics">
               <div><span>Pages complete</span><strong id="pageCount">0 / ?</strong></div>
               <div><span>Active sessions</span><strong id="activeCount">0</strong></div>
@@ -57,17 +57,18 @@
             </div>
             <div id="pageList" class="page-list"><span class="muted">Page details will appear after the first page is validated.</span></div>
             <div class="active-sessions">
-              <strong>Active Fountain progress</strong>
+              <strong>Active page-code progress</strong>
               <div id="sessionProgress" class="muted">No active sessions</div>
             </div>
           </section>
 
           <section class="panel">
             <div class="panel-heading"><div><div class="eyebrow">PLAYBACK</div><h2>Reconstructed audio</h2></div></div>
-            <audio id="audioPlayer" controls preload="none" hidden></audio>
-            <p id="audioStatus" class="status-detail">Waiting for all pages; playback will not skip missing pages.</p>
+            <audio id="audioPlayer" preload="none" hidden></audio>
+            <button id="playbackButton" class="button button-download" type="button" disabled hidden>Play audio</button>
+            <p id="audioStatus" class="status-detail">Scan pages in order; playback becomes available after the first complete Ogg page is recovered.</p>
             <button id="downloadButton" class="button button-download" type="button" disabled hidden>Download complete Ogg Opus book</button>
-            <div class="local-note">The complete Ogg Opus file is reconstructed and hash-checked before playback or download is enabled.</div>
+            <div class="local-note">Original Ogg Opus bytes are preserved. Playback waits for missing pages and complete Ogg pages; download is enabled after the original file is verified.</div>
           </section>
           <p class="local-note">Camera frames, scanned fragments, and reconstructed audio remain on this device.</p>
         </aside>

@@ -11,6 +11,7 @@ import {
   qrModulesForFragment,
   renderQrFragment,
 } from '../src/qr-grid.js';
+import { encodePageFragments } from '../src/page-fountain.js';
 
 const VERSION = '0.1.0';
 
@@ -25,7 +26,7 @@ Usage:
   murfile inspect <file|directory|-> [--json]
 
 Commands:
-  encode    Encode a file as ur:bytes MUR fragments and QR PNG images.
+  encode    Encode a file as UR fragments and QR PNG images.
   decode    Reconstruct a file from .ur/.txt files or stdin.
   inspect   Validate fragments and show fountain decoder progress.
 
@@ -35,8 +36,8 @@ Encode options:
   --max-fragment-length <bytes>   Maximum MUR fragment payload (default: largest QR-fitting size)
   --qr-version <version>           Force QR matrix version 1-40 (default: automatic)
   --grid <columns>x<rows>          Arrange QR codes on PNG pages, e.g. 3x3
-  --fountain-scope <scope>         global|page|both (default: global; page and both require --grid)
-  --page-redundancy <profile>       default|low (page-scoped Fountain repair frames)
+  --fountain-scope <scope>         global|page|both (default: global; page mode uses MDS-coded grid pages)
+  --page-redundancy <profile>       default|low (page-scoped erasure-recovery capacity)
   --grid-gap <pixels>              Gap between QR codes (default: 24; requires --grid)
   --grid-padding <pixels>          Outer grid margin (default: 48; requires --grid)
   --size <pixels>                 QR image width/height (default: 512)
@@ -239,8 +240,9 @@ async function encodeCommand(inputPath, options) {
   if (fountainScope === 'both') {
     const framesPerPage = grid.columns * grid.rows;
     if (framesPerPage < 3) {
-      throw new Error('--grid needs at least 3 cells so each page can contain data and repair fragments.');
+      throw new Error('--grid needs at least 3 cells so each page can contain source and recovery symbols.');
     }
+    if (framesPerPage > 255) throw new Error('Page-scoped grids support at most 255 QR cells.');
     const repairFramesPerPage = pageRepairFrameCount(framesPerPage, pageRedundancy);
     if (framesPerPage - repairFramesPerPage < 2) {
       throw new Error('--grid must leave at least two data frames per page.');
@@ -305,12 +307,13 @@ async function encodeCommand(inputPath, options) {
     return;
   }
 
-  // Page scope creates one independent Fountain session per printed page.
+  // Page scope creates one independent MDS-coded session per printed page.
   if (grid && fountainScope === 'page') {
     const framesPerPage = grid.columns * grid.rows;
     if (framesPerPage < 3) {
-      throw new Error('--grid needs at least 3 cells so each page can contain data and repair fragments.');
+      throw new Error('--grid needs at least 3 cells so each page can contain source and recovery symbols.');
     }
+    if (framesPerPage > 255) throw new Error('Page-scoped grids support at most 255 QR cells.');
     const repairFramesPerPage = pageRepairFrameCount(framesPerPage, pageRedundancy);
     const dataFramesPerPage = framesPerPage - repairFramesPerPage;
     if (dataFramesPerPage < 2) {
@@ -340,14 +343,17 @@ async function encodeCommand(inputPath, options) {
         chunk,
         fileSha256: fileHash,
       });
-      const pageEncoder = new FileEncoder(envelope, { maxFragmentLength });
-      if (pageEncoder.isSinglePart || pageEncoder.sourcePartCount !== dataFramesPerPage) {
+      const { fragments: pageFragments, sourcePartCount } = encodePageFragments(
+        envelope,
+        maxFragmentLength,
+        framesPerPage,
+      );
+      if (sourcePartCount !== dataFramesPerPage) {
         throw new Error(
-          `Internal page sizing error: page ${pageIndex + 1} has ${pageEncoder.sourcePartCount} ` +
+          `Internal page sizing error: page ${pageIndex + 1} has ${sourcePartCount} ` +
           `source fragments; expected ${dataFramesPerPage}.`,
         );
       }
-      const pageFragments = pageEncoder.take(framesPerPage);
       if (pageFragments.length !== framesPerPage) {
         throw new Error(`Page ${pageIndex + 1} did not produce ${framesPerPage} frames.`);
       }
@@ -390,7 +396,8 @@ async function encodeCommand(inputPath, options) {
     const manifest = {
       format: 'MUR-PAGES',
       fountainScope,
-      urType: 'bytes',
+      urType: 'murpage',
+      payloadUrType: 'bytes',
       originalFilename: basename(inputPath),
       originalSize: input.byteLength,
       sha256: fileHash,
@@ -399,6 +406,7 @@ async function encodeCommand(inputPath, options) {
       sourcePartCountPerPage: dataFramesPerPage,
       repairFramesPerPage,
       pageRedundancy,
+      pageCode: 'vandermonde-gf256-v1',
       maxFragmentLength,
       qr: { size, correction, version: actualQrVersion, modules: firstQrModules },
       grid: {
@@ -411,11 +419,14 @@ async function encodeCommand(inputPath, options) {
         dataFramesPerPage,
         repairFramesPerPage,
         pageRedundancy,
+        pageCode: 'vandermonde-gf256-v1',
+        guaranteedErasures: repairFramesPerPage,
         ordering: 'row-major',
         fountainScope,
+        urType: 'murpage',
       },
       generatedBy: `murfile/${VERSION}`,
-      protocol: 'Blockchain Commons BCR-2020-005 + BCR-2024-001',
+      protocol: 'Blockchain Commons BCR-2020-005 + BCR-2024-001; Murfile page MDS v1',
     };
     await writeFile(join(outputDirectory, 'manifest.json'), `${JSON.stringify(manifest, null, 2)}\n`, 'utf8');
 
@@ -427,8 +438,8 @@ async function encodeCommand(inputPath, options) {
     console.log(`Output:  ${outputDirectory}`);
     console.log(`Format:  ${format}`);
     console.log(`QR:      version ${actualQrVersion} (${firstQrModules} modules)`);
-    console.log(`Grid:    ${grid.columns}x${grid.rows}, ${pageCount} independent Fountain sessions`);
-    console.log(`Per page: ${dataFramesPerPage} source + ${repairFramesPerPage} repair frames`);
+    console.log(`Grid:    ${grid.columns}x${grid.rows}, ${pageCount} independent page-code sessions`);
+    console.log(`Per page: ${dataFramesPerPage} source blocks -> ${framesPerPage} mixed MDS symbols`);
     return;
   }
 

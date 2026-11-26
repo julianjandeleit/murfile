@@ -9,7 +9,7 @@ The project deliberately reuses the published Blockchain Commons TypeScript impl
 - [`@blockchaincommons/multipart-ur`](https://github.com/BlockchainCommons/bc-mur-ts) for standards-compatible QR rendering.
 - [`@undecaf/zbar-wasm`](https://github.com/undecaf/zbar-wasm) for local multi-symbol QR recognition in the browser.
 
-No UR, Bytewords, fountain-code or QR encoder is reimplemented here. `murfile` adds file-oriented APIs, command-line workflows, tests and a camera UI.
+UR, Bytewords, Fountain and QR encoding use the published Blockchain Commons implementations. Page-scoped mode additionally uses a non-systematic Vandermonde MDS erasure code over the Fountain source blocks.
 
 > **Maturity:** the Blockchain Commons TypeScript UR/MUR packages are currently published as beta software. This repository is a prototype/integration layer, not an audited production transfer tool. Validate it against independent implementations and the target phones before relying on it.
 
@@ -48,7 +48,7 @@ if (decoder.complete) {
 }
 ```
 
-`FileEncoder` creates `ur:bytes` with a CBOR byte-string payload. If the complete CBOR payload fits in one configured fragment, it emits one ordinary UR; otherwise it delegates MUR fragmentation to Blockchain Commons' `MultipartEncoder`. The MUR stream is infinite by design; callers choose how many parts to export.
+`FileEncoder` creates `ur:bytes` with a CBOR byte-string payload. If the complete CBOR payload fits in one configured fragment, it emits one ordinary UR; otherwise it delegates MUR fragmentation to Blockchain Commons' `MultipartEncoder`. The MUR stream is infinite by design; callers choose how many parts to export. Page-scoped exports wrap the MUR source blocks in Murfile's `ur:murpage` MDS code so that any configured number of missing cells can be recovered; global exports remain standard MUR.
 
 `FileDecoder` routes multipart fragments to the official `MultipartDecoder` and single-part URs to `UR.parse()`. It exposes the official fountain decoder's `progress` value (0–1), as well as received, duplicate, redundant and invalid counters.
 
@@ -92,10 +92,10 @@ Available options:
 - `--max-fragment-length <bytes>`: fragment payload size; default 100.
 - `--size <pixels>`: QR PNG side length; default 512.
 - `--correction low|medium|quartile|high`: QR error correction; default `medium`.
-- `--fountain-scope global|page|both`: use one global Fountain session (`global`, default), independent sessions per grid page (`page`), or export both variants (`both`; the latter two require `--grid`).
+- `--fountain-scope global|page|both`: use one global Fountain session (`global`, default), independent MDS-coded sessions per grid page (`page`), or export both variants (`both`; the latter two require `--grid`).
 - `--force`: permit writing into a non-empty output directory.
 
-`--grid` controls the visual arrangement of QR codes independently of the Fountain scope. With `global`, frames on different grid pages belong to the same MUR session. With `page`, each grid page is independently decodable and includes its own repair frames; `--frames` is not supported because the grid capacity determines the number of frames per page.
+`--grid` controls the visual arrangement of QR codes independently of the Fountain scope. With `global`, frames on different grid pages belong to the same standard MUR session. With `page`, each grid page is independently decodable and every QR is a mixed MDS code symbol; any `repairFramesPerPage` cells may be missing in any positions. `--frames` is not supported because the grid capacity determines the number of frames per page. Page-scoped output uses the `ur:murpage` type and requires Murfile's decoder; global output remains interoperable standard MUR.
 
 With `--fountain-scope both`, murfile creates two separate output directories, `global/` and `page/`, each with its own manifest and UR fragments. Decode them separately:
 
@@ -110,7 +110,7 @@ Examples:
 # One global Fountain session, visually arranged as 3x3 pages
 murfile encode ./song.mp3 --out ./song-global --grid 3x3 --fountain-scope global
 
-# Independent Fountain session for every 3x3 page
+# Independent MDS-coded session for every 3x3 page
 murfile encode ./song.mp3 --out ./song-pages --grid 3x3 --fountain-scope page
 
 # Export both encodings in separate subdirectories
@@ -140,32 +140,32 @@ murfile inspect ./song-qr --json
 
 `inspect` reports the number of UR strings, fountain progress, accepted fragments, duplicates, redundant fragments and invalid URs.
 
-### Page-scoped Fountain redundancy
+### Page-scoped erasure recovery
 
-Murfile preserves its existing page-repair ratio by default. For page-scoped exports, `--page-redundancy low` instead reserves one quarter of each grid's cells for Fountain repair fragments:
+Page-scoped exports MDS-encode every QR as a mixture of the page's source blocks. The selected redundancy is a guaranteed erasure count, independent of which cells are lost. For example, `--page-redundancy low` on a 4x4 grid reserves four cells' worth of recovery capacity, so any four QR cells may be missing:
 
 ```bash
 murfile encode ./recording.mp3 --out ./pages \
   --grid 4x4 --fountain-scope page --page-redundancy low
 ```
 
-For a 4x4 grid this is 12 source and 4 repair frames per page. The option applies only to page-scoped (or `both`) output; global Fountain exports retain their existing frame-count behavior.
+For a 4x4 grid this encodes 12 source blocks into 16 mixed QR symbols. Page-scoped QR strings use the `ur:murpage` type and require Murfile's decoder; global Fountain exports retain standard MUR and its existing frame-count behavior.
 
 ## Soundbook
 
-The separate Soundbook CLI transcodes one complete recording to Ogg Opus and divides the compressed bytes into independent page-scoped Fountain sessions. Audio segmentation is not enabled yet, so playback and download become available only after every page is reconstructed and the whole-book SHA-256 validates.
+Soundbook preserves an existing Ogg Opus file byte-for-byte, divides its original bytes into contiguous page chunks, and encodes each chunk as its own page-scoped MDS session. The reader plays only the contiguous prefix of complete Ogg pages, pauses at a missing page, and resumes when the gap is recovered. The optional original-file download becomes available after every chunk and the whole-file SHA-256 are verified.
 
 ```bash
-npm run cli:soundbook -- encode ./recording.wav --out ./recording-book
+npm run cli:soundbook -- encode ./recording.opus --out ./recording-book
 npm run dev:soundbook
 npm run build:soundbook
 ```
 
-FFmpeg and ffprobe must be installed and available on `PATH`. Defaults are a 48 kb/s, 48 kHz stereo Ogg Opus transcode, 4x4 grid, QR version 20, QR error correction L, and minimal Fountain redundancy (1 repair cell per 16-cell page). Use `--fountain-redundancy low` for 4 repair cells or `default` for 5. The reader is served from its own Vite root and can be deployed separately from Murfile.
+The input must be an Ogg Opus file. `ffprobe` is used only to read codec and duration metadata; Soundbook does not invoke an encoder or alter the audio bytes. Defaults are a 4x4 grid, QR version 20, QR error correction L, and minimal page redundancy (1 erasure-recovery symbol per 16-cell page). Every QR is a mixed symbol, so any one missing cell can be recovered regardless of its position. Use `--fountain-redundancy low` or `default` to guarantee recovery from more missing cells, reducing the source bytes available per page. The reader is served from its own Vite root and can be deployed separately from Murfile.
 
-Minimal Fountain redundancy increases the data allocation from 12 to 15 QR cells per grid. The exact compressed-audio payload depends on the chosen redundancy profile; the UR/Bytewords text and Fountain framing reduce usable capacity. `--qr-version 28` provides additional capacity, but version 20 remains the default. Printed-module size and camera performance still require physical-device validation.
+Minimal redundancy allocates 15 source blocks and one recovery equation per 4x4 grid; every one of the 16 QR symbols mixes those blocks, so any single QR may be absent. Higher redundancy guarantees recovery from multiple missing cells. The exact source-byte payload depends on the QR profile; UR/Bytewords and MDS framing reduce usable capacity. `--qr-version 28` provides additional capacity, but version 20 remains the default. Printed-module size and camera performance still require physical-device validation.
 
-The reader reports completed/missing pages and active Fountain sessions, waits rather than skipping a missing page, and enables playback plus an optional `.ogg` download only after the complete file is reconstructed. The whole compressed recording is one stream at this stage; later audio-segment support is required for playback to begin before all pages arrive.
+Each reconstructed page is verified against its chunk SHA-256 before use. For incremental playback, the reader combines only consecutive chunks starting at page 1 and exposes complete Ogg pages to the player. A later page cannot bypass a gap. The downloaded `.opus` file is the original byte stream, verified against the whole-file SHA-256.
 
 ## Live web reader
 
@@ -223,7 +223,7 @@ The Node test suite covers:
 - rejection of other UR types;
 - CLI encode/decode roundtrip using text sidecars;
 - shared QR/grid API behavior and fixed-version rendering;
-- Soundbook envelope validation, interleaved page reconstruction, integrity checks, and FFmpeg CLI roundtrip;
+- Soundbook envelope validation, byte-exact page reconstruction, incremental Ogg-prefix readiness, integrity checks, and original-file roundtrip;
 - a 2.1 MB roundtrip matching the intended file-size range.
 
 These tests run against the installed Blockchain Commons TypeScript package. They do not replace differential interoperability tests against the Rust/Swift/C++ reference implementations, printed-page tests, or physical-device camera validation.

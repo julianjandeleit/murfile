@@ -1,8 +1,9 @@
 import { extractCbor } from '@blockchaincommons/dcbor';
-import { MultipartDecoder, UR } from '@blockchaincommons/uniform-resources';
+import { UR } from '@blockchaincommons/uniform-resources';
 import { decodeBytewords } from '@blockchaincommons/uniform-resources/bytewords';
 import { decodeFountainPart } from '@blockchaincommons/uniform-resources/fountain';
 import { parseSoundbookPageEnvelope } from './soundbook-transfer.js';
+import { PageMultipartDecoder } from './page-fountain.js';
 
 const MULTIPART_CANDIDATE = /^ur:[^/]+\/\+?[0-9]+-\+?[0-9]+\//;
 
@@ -13,7 +14,8 @@ function sessionKeyForUr(value) {
   }
   const partBytes = decodeBytewords(value.slice(separator + 1), 'minimal');
   const part = decodeFountainPart(partBytes);
-  return `${part.seqLen}:${part.messageLen}:${part.checksum}:${part.data.byteLength}`;
+  const type = value.slice(3, value.indexOf('/')).toLowerCase();
+  return `${type}:${part.seqLen}:${part.messageLen}:${part.checksum}:${part.data.byteLength}`;
 }
 
 function bytesFromUr(ur) {
@@ -29,9 +31,12 @@ function bytesFromUr(ur) {
 
 function sameBookMetadata(a, b) {
   return a.bookId === b.bookId &&
+    a.format === b.format &&
     a.pageCount === b.pageCount &&
     a.audioLength === b.audioLength &&
-    a.chunkCapacity === b.chunkCapacity &&
+    (a.format === 'SOUNDBOOK-1' || a.format === 'SOUNDBOOK-3'
+      ? a.chunkCapacity === b.chunkCapacity
+      : a.segmentCapacity === b.segmentCapacity) &&
     a.durationMicros === b.durationMicros &&
     a.codec === b.codec &&
     a.audioSha256 === b.audioSha256;
@@ -49,7 +54,7 @@ async function sha256Hex(bytes) {
   return Array.from(new Uint8Array(digest), (byte) => byte.toString(16).padStart(2, '0')).join('');
 }
 
-/** Reconstructs one Soundbook audio book from independent page Fountain sessions. */
+/** Reconstructs one Soundbook audio book from independent page-coded sessions. */
 export class SoundbookDecoder {
   #sessions = new Map();
   #completedSessions = new Set();
@@ -89,11 +94,16 @@ export class SoundbookDecoder {
       ? Array.from({ length: metadata.pageCount }, (_, index) => index)
         .filter((index) => !this.#pages.has(index))
       : [];
+    let contiguousPageCount = 0;
+    while (this.#pages.has(contiguousPageCount)) contiguousPageCount += 1;
     return {
+      format: metadata?.format ?? null,
       bookId: metadata?.bookId ?? null,
       pageCount: metadata?.pageCount ?? null,
       completedPages: this.#pages.size,
+      contiguousPageCount,
       missingPages,
+      availablePages: [...this.#pages.keys()].sort((a, b) => a - b),
       activeSessions: [...this.#sessions.entries()].map(([key, session]) => ({
         key,
         progress: session.decoder.progress,
@@ -103,7 +113,9 @@ export class SoundbookDecoder {
       duplicatesIgnored: this.duplicatesIgnored,
       redundantFragments: this.redundantFragments,
       invalidUris: this.invalidUris,
-      audioAvailable: this.complete,
+      audioAvailable: metadata?.format === 'SOUNDBOOK-2' || metadata?.format === 'SOUNDBOOK-3'
+        ? this.#pages.size > 0
+        : this.complete,
       audioDurationMicros: metadata?.durationMicros ?? null,
       audioBytes: this.complete ? this.#audioBytes.byteLength : null,
       complete: this.complete,
@@ -111,8 +123,155 @@ export class SoundbookDecoder {
   }
 
   async #acceptPage(page) {
+    if (page.format === 'SOUNDBOOK-2') return this.#acceptSegment(page);
+    if (page.format === 'SOUNDBOOK-3') return this.#acceptChunk(page);
+    return this.#acceptLegacyPage(page);
+  }
+
+  async #acceptChunk(page) {
     if (!this.#bookMetadata) {
       this.#bookMetadata = {
+        format: page.format,
+        bookId: page.bookId,
+        pageCount: page.pageCount,
+        audioLength: page.audioLength,
+        chunkCapacity: page.chunkCapacity,
+        durationMicros: page.durationMicros,
+        codec: page.codec,
+        audioSha256: page.audioSha256,
+      };
+    } else if (!sameBookMetadata(this.#bookMetadata, page)) {
+      throw new Error('Page belongs to a different or inconsistent Soundbook.');
+    }
+
+    const existing = this.#pages.get(page.pageIndex);
+    if (existing) {
+      if (!sameBytes(existing, page.chunkBytes)) {
+        throw new Error(`Conflicting data received for Soundbook page ${page.pageIndex + 1}.`);
+      }
+      this.duplicatesIgnored += 1;
+      return { kind: 'duplicate-page', pageIndex: page.pageIndex, status: this.status };
+    }
+
+    if (await sha256Hex(page.chunkBytes) !== page.chunkSha256) {
+      throw new Error(`Soundbook page ${page.pageIndex + 1} chunk SHA-256 integrity check failed.`);
+    }
+
+    if (this.#pages.size + 1 === page.pageCount) {
+      const chunks = Array.from({ length: page.pageCount }, (_, index) =>
+        index === page.pageIndex ? page.chunkBytes : this.#pages.get(index));
+      if (chunks.some((chunk) => !chunk) ||
+          chunks.reduce((total, chunk) => total + chunk.byteLength, 0) !== page.audioLength) {
+        throw new Error('Soundbook chunks do not match the declared book length.');
+      }
+      const audio = new Uint8Array(page.audioLength);
+      let offset = 0;
+      for (const chunk of chunks) {
+        audio.set(chunk, offset);
+        offset += chunk.byteLength;
+      }
+      if (await sha256Hex(audio) !== page.audioSha256) {
+        throw new Error('Soundbook audio SHA-256 integrity check failed; reset and scan the pages again.');
+      }
+      this.#pages.set(page.pageIndex, page.chunkBytes);
+      this.#audioBytes = audio;
+      return {
+        kind: 'book-complete',
+        audioBytes: this.result,
+        chunkBytes: page.chunkBytes.slice(),
+        playbackPageIndex: page.pageIndex,
+        playbackPageCount: page.pageCount,
+        pageIndex: page.pageIndex,
+        status: this.status,
+      };
+    }
+
+    this.#pages.set(page.pageIndex, page.chunkBytes);
+    return {
+      kind: 'page-complete',
+      pageIndex: page.pageIndex,
+      pageCount: page.pageCount,
+      chunkBytes: page.chunkBytes.slice(),
+      playbackPageIndex: page.pageIndex,
+      playbackPageCount: page.pageCount,
+      status: this.status,
+    };
+  }
+
+  async #acceptSegment(page) {
+    if (!this.#bookMetadata) {
+      this.#bookMetadata = {
+        format: page.format,
+        bookId: page.bookId,
+        pageCount: page.pageCount,
+        audioLength: page.audioLength,
+        segmentCapacity: page.segmentCapacity,
+        durationMicros: page.durationMicros,
+        codec: page.codec,
+        audioSha256: page.audioSha256,
+      };
+    } else if (!sameBookMetadata(this.#bookMetadata, page)) {
+      throw new Error('Page belongs to a different or inconsistent Soundbook.');
+    }
+
+    const existing = this.#pages.get(page.pageIndex);
+    if (existing) {
+      if (!sameBytes(existing, page.segmentBytes)) {
+        throw new Error(`Conflicting data received for Soundbook page ${page.pageIndex + 1}.`);
+      }
+      this.duplicatesIgnored += 1;
+      return { kind: 'duplicate-page', pageIndex: page.pageIndex, status: this.status };
+    }
+
+    if (await sha256Hex(page.segmentBytes) !== page.segmentSha256) {
+      throw new Error(`Soundbook page ${page.pageIndex + 1} segment SHA-256 integrity check failed.`);
+    }
+
+    if (this.#pages.size + 1 === page.pageCount) {
+      const segments = Array.from({ length: page.pageCount }, (_, index) =>
+        index === page.pageIndex ? page.segmentBytes : this.#pages.get(index));
+      if (segments.some((segment) => !segment) ||
+          segments.reduce((total, segment) => total + segment.byteLength, 0) !== page.audioLength) {
+        throw new Error('Soundbook segments do not match the declared book length.');
+      }
+      const audio = new Uint8Array(page.audioLength);
+      let offset = 0;
+      for (const segment of segments) {
+        audio.set(segment, offset);
+        offset += segment.byteLength;
+      }
+      if (await sha256Hex(audio) !== page.audioSha256) {
+        throw new Error('Soundbook audio SHA-256 integrity check failed; reset and scan the pages again.');
+      }
+      this.#pages.set(page.pageIndex, page.segmentBytes);
+      this.#audioBytes = audio;
+      return {
+        kind: 'book-complete',
+        audioBytes: this.result,
+        segmentBytes: page.segmentBytes.slice(),
+        playbackPageIndex: page.pageIndex,
+        playbackPageCount: page.pageCount,
+        pageIndex: page.pageIndex,
+        status: this.status,
+      };
+    }
+
+    this.#pages.set(page.pageIndex, page.segmentBytes);
+    return {
+      kind: 'page-complete',
+      pageIndex: page.pageIndex,
+      pageCount: page.pageCount,
+      segmentBytes: page.segmentBytes.slice(),
+      playbackPageIndex: page.pageIndex,
+      playbackPageCount: page.pageCount,
+      status: this.status,
+    };
+  }
+
+  async #acceptLegacyPage(page) {
+    if (!this.#bookMetadata) {
+      this.#bookMetadata = {
+        format: page.format,
         bookId: page.bookId,
         pageCount: page.pageCount,
         audioLength: page.audioLength,
@@ -149,6 +308,9 @@ export class SoundbookDecoder {
       return {
         kind: 'book-complete',
         audioBytes: this.result,
+        segmentBytes: this.result,
+        playbackPageIndex: 0,
+        playbackPageCount: 1,
         pageIndex: page.pageIndex,
         status: this.status,
       };
@@ -189,7 +351,7 @@ export class SoundbookDecoder {
 
       let session = this.#sessions.get(sessionKey);
       if (!session) {
-        session = { decoder: new MultipartDecoder(), fragmentsReceived: 0 };
+        session = { decoder: new PageMultipartDecoder(), fragmentsReceived: 0 };
         this.#sessions.set(sessionKey, session);
       }
       const addedInformation = session.decoder.add(normalized);

@@ -4,6 +4,7 @@ import { randomBytes, createHash } from 'node:crypto';
 import { UR } from '@blockchaincommons/uniform-resources';
 import { FileDecoder, FileEncoder, createBytesUr, isMultipartUrCandidate } from '../src/index.js';
 import { createPageEnvelope } from '../src/page-transfer.js';
+import { encodePageFragments } from '../src/page-fountain.js';
 
 function equalBytes(actual, expected) {
   assert.deepEqual(Buffer.from(actual), Buffer.from(expected));
@@ -154,6 +155,33 @@ test('FileDecoder reconstructs independent page-scoped MUR sessions in interleav
   assert.equal(decoder.status.completedPages, 2);
   assert.equal(decoder.status.pageCount, 2);
   assert.equal(decoder.status.expectedSha256, fileHash);
+});
+
+test('page-scoped MDS symbols recover any one missing cell in a 5x5 grid', () => {
+  const original = randomBytes(2800);
+  const fileHash = createHash('sha256').update(original).digest('hex');
+  const envelope = createPageEnvelope({
+    pageIndex: 0,
+    pageCount: 1,
+    originalSize: original.byteLength,
+    chunkLength: original.byteLength,
+    chunk: original,
+    fileSha256: fileHash,
+  });
+  const { fragments, sourcePartCount } = encodePageFragments(envelope, 120, 25);
+
+  assert.equal(sourcePartCount, 24);
+  assert.equal(fragments.length, 25);
+  assert.ok(fragments.every((fragment) => fragment.startsWith('ur:murpage/')));
+
+  for (let missingIndex = 0; missingIndex < fragments.length; missingIndex += 1) {
+    const decoder = new FileDecoder();
+    for (let index = 0; index < fragments.length; index += 1) {
+      if (index !== missingIndex) decoder.add(fragments[index]);
+    }
+    assert.equal(decoder.complete, true, `failed when QR ${missingIndex + 1} was missing`);
+    equalBytes(decoder.result, original);
+  }
 });
 
 test('multipart candidate detection distinguishes single-part URs', () => {

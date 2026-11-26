@@ -1,8 +1,9 @@
 import { extractCbor } from '@blockchaincommons/dcbor';
-import { MultipartDecoder, UR } from '@blockchaincommons/uniform-resources';
+import { UR } from '@blockchaincommons/uniform-resources';
 import { decodeBytewords } from '@blockchaincommons/uniform-resources/bytewords';
 import { decodeFountainPart } from '@blockchaincommons/uniform-resources/fountain';
 import { parsePageEnvelope } from './page-transfer.js';
+import { PageMultipartDecoder } from './page-fountain.js';
 
 // BCR MUR parts have: ur:<type>/<seqNum>-<seqLen>/<bytewords>.
 const MULTIPART_CANDIDATE = /^ur:[^/]+\/\+?[0-9]+-\+?[0-9]+\//;
@@ -26,7 +27,8 @@ function sessionKeyForUr(value) {
   }
   const partBytes = decodeBytewords(normalized.slice(separator + 1), 'minimal');
   const part = decodeFountainPart(partBytes);
-  return `${part.seqLen}:${part.messageLen}:${part.checksum}:${part.data.byteLength}`;
+  const type = normalized.slice(3, normalized.indexOf('/')).toLowerCase();
+  return `${type}:${part.seqLen}:${part.messageLen}:${part.checksum}:${part.data.byteLength}`;
 }
 
 function samePageMetadata(a, b) {
@@ -41,8 +43,8 @@ export function isMultipartUrCandidate(value) {
 }
 
 /**
- * Decoder for ordinary global MUR sessions and independent page-scoped MUR sessions.
- * Each page session is identified from its standard fountain-part metadata.
+ * Decoder for ordinary global MUR sessions and independent page-coded sessions.
+ * Page-coded MDS symbols and legacy standard Fountain pages are both accepted.
  */
 export class FileDecoder {
   #sessions = new Map();
@@ -203,7 +205,7 @@ export class FileDecoder {
 
         let session = this.#sessions.get(sessionKey);
         if (!session) {
-          session = { decoder: new MultipartDecoder() };
+          session = { decoder: new PageMultipartDecoder() };
           this.#sessions.set(sessionKey, session);
         }
         const addedInformation = session.decoder.add(normalized);

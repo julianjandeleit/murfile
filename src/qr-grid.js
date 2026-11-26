@@ -1,6 +1,7 @@
 import { RenderedImage, qrModuleCount, renderUrQr } from '@blockchaincommons/multipart-ur';
 import { encodeQr as encodeFixedQr } from './vendor/qr-fixed.js';
 import { createBytesUr, FileEncoder } from './encoder.js';
+import { encodePageFragments } from './page-fountain.js';
 
 const AUTO_FRAME_REDUNDANCY = 0.10;
 const QR_EC_LEVELS = { low: 'L', medium: 'M', quartile: 'Q', high: 'H' };
@@ -132,6 +133,17 @@ function candidateFragmentsFitQrVersion(
   if (requestedSourcePartCount !== undefined &&
       encoder.sourcePartCount !== requestedSourcePartCount) {
     return false;
+  }
+  if (requestedSourcePartCount !== undefined) {
+    const { fragments } = encodePageFragments(testData, fragmentLength, requestedFrameCount);
+    try {
+      for (const fragment of fragments) {
+        qrModulesForFragment(fragment, correction, requestedVersion);
+      }
+      return true;
+    } catch {
+      return false;
+    }
   }
   if (encoder.isSinglePart) {
     try {

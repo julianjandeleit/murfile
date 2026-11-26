@@ -202,6 +202,9 @@ test('CLI exports QR frames as row-major grid PNG pages', async () => {
     assert.equal(manifest.grid.pageCount, Math.ceil(manifest.frameCount / (columns * rows)));
     assert.equal(manifest.grid.dataFramesPerPage, 3);
     assert.equal(manifest.grid.repairFramesPerPage, 1);
+    assert.equal(manifest.grid.pageCode, 'vandermonde-gf256-v1');
+    assert.equal(manifest.grid.guaranteedErasures, 1);
+    assert.equal(manifest.urType, 'murpage');
     assert.equal(manifest.grid.ordering, 'row-major');
     assert.equal(manifest.qr.version, targetVersion);
 

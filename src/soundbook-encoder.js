@@ -1,4 +1,5 @@
 import { FileEncoder } from './encoder.js';
+import { encodePageFragments } from './page-fountain.js';
 import {
   chooseMaxFragmentLength,
   composeGridPage,
@@ -6,9 +7,9 @@ import {
   renderQrFragment,
 } from './qr-grid.js';
 import {
-  createSoundbookPageEnvelope,
+  createSoundbookChunkEnvelope,
   MAX_SOUNDBOOK_PAGES,
-  SOUNDBOOK_HEADER_LENGTH,
+  SOUNDBOOK_CHUNK_HEADER_LENGTH,
 } from './soundbook-transfer.js';
 
 function cborByteStringHeaderLength(length) {
@@ -22,14 +23,14 @@ function cborByteStringHeaderLength(length) {
 function calculateChunkCapacity(maxFragmentLength, dataFramesPerPage) {
   const targetLength = maxFragmentLength * dataFramesPerPage;
   if (!Number.isSafeInteger(targetLength)) throw new Error('Soundbook page capacity is too large.');
-  let chunkCapacity = targetLength - SOUNDBOOK_HEADER_LENGTH - 9;
+  let chunkCapacity = targetLength - SOUNDBOOK_CHUNK_HEADER_LENGTH - 9;
   for (let iteration = 0; iteration < 10; iteration += 1) {
-    const envelopeLength = SOUNDBOOK_HEADER_LENGTH + chunkCapacity;
-    const next = targetLength - SOUNDBOOK_HEADER_LENGTH - cborByteStringHeaderLength(envelopeLength);
+    const envelopeLength = SOUNDBOOK_CHUNK_HEADER_LENGTH + chunkCapacity;
+    const next = targetLength - SOUNDBOOK_CHUNK_HEADER_LENGTH - cborByteStringHeaderLength(envelopeLength);
     if (next === chunkCapacity) break;
     chunkCapacity = next;
   }
-  const envelopeLength = SOUNDBOOK_HEADER_LENGTH + chunkCapacity;
+  const envelopeLength = SOUNDBOOK_CHUNK_HEADER_LENGTH + chunkCapacity;
   if (chunkCapacity < 1 ||
       envelopeLength + cborByteStringHeaderLength(envelopeLength) !== targetLength) {
     throw new Error('Could not calculate a valid Soundbook page payload size.');
@@ -41,10 +42,10 @@ function repairFrameCount(framesPerPage, profile) {
   if (profile === 'minimal') return 1;
   if (profile === 'low') return Math.max(1, Math.ceil(framesPerPage / 4));
   if (profile === 'default') return Math.max(1, Math.round(framesPerPage / 3));
-  throw new Error('Fountain redundancy must be minimal, low or default.');
+  throw new Error('Page redundancy must be minimal, low or default.');
 }
 
-/** Calculate the fixed transport settings for a complete compressed recording. */
+/** Calculate transport settings for exact, contiguous chunks of an Ogg Opus source. */
 export function createSoundbookPagePlan(audioBytes, {
   bookId,
   audioSha256,
@@ -57,6 +58,7 @@ export function createSoundbookPagePlan(audioBytes, {
   gap = 24,
   padding = 48,
   redundancy = 'minimal',
+  chunkHashes,
 } = {}) {
   if (!(audioBytes instanceof Uint8Array) || audioBytes.byteLength === 0) {
     throw new TypeError('audioBytes must be a non-empty Uint8Array.');
@@ -72,6 +74,9 @@ export function createSoundbookPagePlan(audioBytes, {
   }
 
   const framesPerPage = columns * rows;
+  if (!Number.isSafeInteger(framesPerPage) || framesPerPage > 255) {
+    throw new RangeError('Soundbook grids support at most 255 QR cells.');
+  }
   const repairFramesPerPage = repairFrameCount(framesPerPage, redundancy);
   const dataFramesPerPage = framesPerPage - repairFramesPerPage;
   if (dataFramesPerPage < 2) {
@@ -90,12 +95,18 @@ export function createSoundbookPagePlan(audioBytes, {
   if (pageCount > MAX_SOUNDBOOK_PAGES) {
     throw new Error(`Soundbook page count exceeds the limit of ${MAX_SOUNDBOOK_PAGES}.`);
   }
+  if (chunkHashes !== undefined &&
+      (!Array.isArray(chunkHashes) || chunkHashes.length !== pageCount ||
+        chunkHashes.some((value) => typeof value !== 'string' || !/^[0-9a-f]{64}$/i.test(value)))) {
+    throw new TypeError('Each Soundbook byte chunk must have a SHA-256 hash.');
+  }
 
   return {
     bookId,
     audioSha256,
     audioLength: audioBytes.byteLength,
     durationMicros,
+    chunkHashes,
     columns,
     rows,
     size,
@@ -111,7 +122,7 @@ export function createSoundbookPagePlan(audioBytes, {
     chunkCapacity,
     pageCount,
     manifest: {
-      format: 'SOUNDBOOK-1',
+      format: 'SOUNDBOOK-3',
       bookId,
       codec: 'ogg-opus',
       audioLength: audioBytes.byteLength,
@@ -122,6 +133,8 @@ export function createSoundbookPagePlan(audioBytes, {
       sourcePartCount: pageCount * dataFramesPerPage,
       maxFragmentLength,
       pagePayloadBytes: chunkCapacity,
+      byteExact: true,
+      urType: 'murpage',
       qr: { version: qrVersion, correction, size },
       grid: {
         columns,
@@ -130,6 +143,8 @@ export function createSoundbookPagePlan(audioBytes, {
         dataFramesPerPage,
         repairFramesPerPage,
         redundancy,
+        pageCode: 'vandermonde-gf256-v1',
+        guaranteedErasures: repairFramesPerPage,
         gap,
         padding,
         ordering: 'row-major',
@@ -139,7 +154,7 @@ export function createSoundbookPagePlan(audioBytes, {
   };
 }
 
-/** Render and fountain-encode exactly one grid page from a complete recording. */
+/** Render and MDS-encode one contiguous byte chunk from the original audio. */
 export function encodeSoundbookPage(audioBytes, plan, pageIndex) {
   if (!(audioBytes instanceof Uint8Array) || audioBytes.byteLength !== plan.audioLength) {
     throw new TypeError('audioBytes do not match the Soundbook page plan.');
@@ -148,11 +163,14 @@ export function encodeSoundbookPage(audioBytes, plan, pageIndex) {
     throw new RangeError('Soundbook page index is outside the page plan.');
   }
 
+  if (!plan.chunkHashes) {
+    throw new Error('Soundbook pages require per-chunk SHA-256 hashes.');
+  }
   const offset = pageIndex * plan.chunkCapacity;
-  const chunkLength = Math.min(plan.chunkCapacity, audioBytes.byteLength - offset);
+  const chunkLength = Math.min(plan.chunkCapacity, plan.audioLength - offset);
   const chunk = new Uint8Array(plan.chunkCapacity);
   chunk.set(audioBytes.subarray(offset, offset + chunkLength));
-  const envelope = createSoundbookPageEnvelope({
+  const envelope = createSoundbookChunkEnvelope({
     bookId: plan.bookId,
     pageIndex,
     pageCount: plan.pageCount,
@@ -161,17 +179,20 @@ export function encodeSoundbookPage(audioBytes, plan, pageIndex) {
     chunkCapacity: plan.chunkCapacity,
     durationMicros: plan.durationMicros,
     audioSha256: plan.audioSha256,
+    chunkSha256: plan.chunkHashes[pageIndex],
     chunk,
   });
-  const encoder = new FileEncoder(envelope, { maxFragmentLength: plan.maxFragmentLength });
-  if (encoder.isSinglePart || encoder.sourcePartCount !== plan.dataFramesPerPage) {
+  const { fragments, sourcePartCount } = encodePageFragments(
+    envelope,
+    plan.maxFragmentLength,
+    plan.framesPerPage,
+  );
+  if (sourcePartCount !== plan.dataFramesPerPage) {
     throw new Error(
       `Soundbook page sizing error: expected ${plan.dataFramesPerPage} source fragments, ` +
-      `got ${encoder.sourcePartCount}.`,
+      `got ${sourcePartCount}.`,
     );
   }
-
-  const fragments = encoder.take(plan.framesPerPage);
   if (fragments.length !== plan.framesPerPage) {
     throw new Error(`Soundbook page ${pageIndex + 1} did not produce ${plan.framesPerPage} fragments.`);
   }

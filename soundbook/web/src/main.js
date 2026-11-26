@@ -487,8 +487,10 @@ qrWorker.addEventListener('message', (event) => {
   if (event.data?.type === 'scan-result') {
     adaptiveScanResolution.observe({
       sourceWidth: event.data.sourceWidth,
+      scanWidth: event.data.scanWidth,
       isHighResolutionProbe: event.data.isHighResolutionProbe,
       symbolCount: event.data.totalSymbols,
+      smallestSymbolSide: event.data.smallestSymbolSide,
     });
     void handleQrTexts(event.data.texts || []).catch((error) => {
       elements.statusTitle.textContent = 'Soundbook processing failed';

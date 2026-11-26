@@ -333,8 +333,10 @@ qrWorker.addEventListener('message', (event) => {
   if (message?.type === 'scan-result') {
     adaptiveScanResolution.observe({
       sourceWidth: message.sourceWidth,
+      scanWidth: message.scanWidth,
       isHighResolutionProbe: message.isHighResolutionProbe,
       symbolCount: message.totalSymbols,
+      smallestSymbolSide: message.smallestSymbolSide,
     });
     handleQrTexts(message.texts || []);
   } else if (message?.type === 'scan-error') {

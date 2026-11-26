@@ -27,10 +27,12 @@ test('repeated scans keep returning every QR code from a static grid', async () 
 
   for (let scan = 0; scan < 6; scan += 1) {
     const symbols = await scanImageDataWithoutCache(imageData);
+    const qrSymbols = symbols.filter((symbol) => /qr/i.test(symbol.typeName || ''));
     assert.equal(
-      symbols.filter((symbol) => /qr/i.test(symbol.typeName || '')).length,
+      qrSymbols.length,
       16,
       `scan ${scan + 1} should detect all QR codes again`,
     );
+    assert.ok(qrSymbols.every((symbol) => symbol.points.length >= 3));
   }
 });

@@ -10,6 +10,14 @@ self.addEventListener('message', async (event) => {
     const symbols = await scanImageDataWithoutCache(imageData);
     const qrSymbols = symbols.filter((symbol) => /qr/i.test(symbol.typeName || ''));
     const texts = [];
+    const symbolSides = qrSymbols
+      .map((symbol) => {
+        if (!Array.isArray(symbol.points) || symbol.points.length < 3) return 0;
+        const xs = symbol.points.map((point) => point.x);
+        const ys = symbol.points.map((point) => point.y);
+        return Math.min(Math.max(...xs) - Math.min(...xs), Math.max(...ys) - Math.min(...ys));
+      })
+      .filter((side) => Number.isFinite(side) && side > 0);
 
     for (const symbol of qrSymbols) {
       try {
@@ -23,9 +31,11 @@ self.addEventListener('message', async (event) => {
     self.postMessage({
       type: 'scan-result',
       frameId,
+      scanWidth: width,
       sourceWidth: message.sourceWidth,
       isHighResolutionProbe: message.isHighResolutionProbe,
       totalSymbols: qrSymbols.length,
+      smallestSymbolSide: symbolSides.length ? Math.min(...symbolSides) : 0,
       texts,
     });
   } catch (error) {

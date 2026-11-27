@@ -7,7 +7,9 @@ self.addEventListener('message', async (event) => {
   try {
     const { width, height, pixels, frameId } = message;
     const imageData = new ImageData(new Uint8ClampedArray(pixels), width, height);
+    const scanStartedAt = performance.now();
     const symbols = await scanImageDataWithoutCache(imageData);
+    const scanDurationMs = performance.now() - scanStartedAt;
     const qrSymbols = symbols.filter((symbol) => /qr/i.test(symbol.typeName || ''));
     const texts = [];
     const symbolSides = qrSymbols
@@ -19,6 +21,7 @@ self.addEventListener('message', async (event) => {
       })
       .filter((side) => Number.isFinite(side) && side > 0);
 
+    const textDecodeStartedAt = performance.now();
     for (const symbol of qrSymbols) {
       try {
         const text = symbol.decode();
@@ -27,13 +30,18 @@ self.addEventListener('message', async (event) => {
         // Ignore one unreadable symbol without discarding other QR results.
       }
     }
+    const textDecodeDurationMs = performance.now() - textDecodeStartedAt;
 
     self.postMessage({
       type: 'scan-result',
       frameId,
       scanWidth: width,
+      scanHeight: height,
       sourceWidth: message.sourceWidth,
       isHighResolutionProbe: message.isHighResolutionProbe,
+      captureDurationMs: message.captureDurationMs,
+      scanDurationMs,
+      textDecodeDurationMs,
       totalSymbols: qrSymbols.length,
       smallestSymbolSide: symbolSides.length ? Math.min(...symbolSides) : 0,
       texts,

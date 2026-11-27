@@ -10,6 +10,7 @@ const elements = {
   videoPlaceholder: $('videoPlaceholder'),
   cameraSelect: $('cameraSelect'),
   cameraResolution: $('cameraResolution'),
+  scanDiagnostics: $('scanDiagnostics'),
   cameraState: $('cameraState'),
   startButton: $('startButton'),
   stopButton: $('stopButton'),
@@ -44,6 +45,8 @@ let animationFrameId = 0;
 let lastFrameAt = 0;
 let frameId = 0;
 let workerBusy = false;
+let frameCaptureMs = 0;
+let frameSubmittedAt = 0;
 let selectedCameraId = '';
 let decodedQrCount = 0;
 const audioSegments = new Map();
@@ -427,14 +430,17 @@ function submitFrame() {
   const scan = adaptiveScanResolution.next(sourceWidth);
   const width = scan.width;
   const height = Math.max(1, Math.round(sourceHeight * width / sourceWidth));
+  const captureStartedAt = performance.now();
   if (canvas.width !== width || canvas.height !== height) {
     canvas.width = width;
     canvas.height = height;
   }
   context.drawImage(elements.video, 0, 0, width, height);
   const imageData = context.getImageData(0, 0, width, height);
+  frameCaptureMs = performance.now() - captureStartedAt;
   workerBusy = true;
   frameId += 1;
+  frameSubmittedAt = performance.now();
   qrWorker.postMessage({
     type: 'scan-frame',
     frameId,
@@ -442,6 +448,7 @@ function submitFrame() {
     height,
     sourceWidth,
     isHighResolutionProbe: scan.isHighResolutionProbe,
+    captureDurationMs: frameCaptureMs,
     pixels: imageData.data.buffer,
   }, [imageData.data.buffer]);
 }
@@ -485,18 +492,29 @@ async function handleQrTexts(texts) {
 qrWorker.addEventListener('message', (event) => {
   workerBusy = false;
   if (event.data?.type === 'scan-result') {
+    const message = event.data;
+    const roundTripMs = performance.now() - frameSubmittedAt;
+    const mqrCount = (message.texts || []).filter((text) => text.startsWith('MQR1:')).length;
+    elements.scanDiagnostics.textContent =
+      `Scan ${message.scanWidth}×${message.scanHeight} px · ` +
+      `prep ${Math.round(message.captureDurationMs)} ms · ` +
+      `ZBar ${Math.round(message.scanDurationMs)} ms · ` +
+      `text decode ${Math.round(message.textDecodeDurationMs)} ms · ` +
+      `${message.totalSymbols} QR found / ${(message.texts || []).length} decoded / ${mqrCount} MQR1 · ` +
+      `${Math.round(roundTripMs)} ms total`;
     adaptiveScanResolution.observe({
-      sourceWidth: event.data.sourceWidth,
-      scanWidth: event.data.scanWidth,
-      isHighResolutionProbe: event.data.isHighResolutionProbe,
-      symbolCount: event.data.totalSymbols,
-      smallestSymbolSide: event.data.smallestSymbolSide,
+      sourceWidth: message.sourceWidth,
+      scanWidth: message.scanWidth,
+      isHighResolutionProbe: message.isHighResolutionProbe,
+      symbolCount: message.totalSymbols,
+      smallestSymbolSide: message.smallestSymbolSide,
     });
-    void handleQrTexts(event.data.texts || []).catch((error) => {
+    void handleQrTexts(message.texts || []).catch((error) => {
       elements.statusTitle.textContent = 'Soundbook processing failed';
       elements.statusDetail.textContent = error.message;
     });
   } else if (event.data?.type === 'scan-error') {
+    elements.scanDiagnostics.textContent = `Scan failed: ${event.data.message}`;
     elements.statusDetail.textContent = `QR recognition: ${event.data.message}`;
   }
 });
